@@ -1,483 +1,2051 @@
+
 #!/usr/bin/env Rscript
-# OMIM gene downloader
-# Primary:  OMIM API
-# Fallback: OMIM web search scraping
+
+# ============================================================================
+# OMIM / NCBI MedGen structured gene downloader
+#
+# Preferred path:
+#   1. OMIM API, if an OMIM_API_KEY is available
+#
+# Structured fallback:
+#   2. NCBI mim2gene_medgen
+#   3. NCBI MedGen_HPO_OMIM_Mapping.txt.gz
+#   4. NCBI Homo_sapiens.gene_info.gz
+#
+# IMPORTANT:
+#   This script DOES NOT scrape OMIM HTML.
+#
+# The NCBI fallback is labelled:
+#   OMIM_DERIVED_MEDGEN_GENE_MAP
+#
+# because the records are accessed through NCBI MedGen/Gene rather than
+# directly through the OMIM API.
 #
 # Usage:
-#   export OMIM_API_KEY="your_key_here"
-#   Rscript omim_combined.R migraine
+#   Rscript omim.R migraine
 #
-# Or:
-#   Rscript omim_combined.R migraine your_key_here
+# Optional:
+#   export OMIM_API_KEY="..."
+#   Rscript omim.R migraine
+#
+# Force refresh of NCBI files:
+#   Rscript omim.R migraine --refresh
+# ============================================================================
 
-required_packages <- c("httr", "jsonlite", "rvest", "stringr")
+
+required_packages <- c(
+  "httr",
+  "jsonlite"
+)
 
 for (pkg in required_packages) {
-  if (!require(pkg, character.only = TRUE, quietly = TRUE)) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
     cat("Installing", pkg, "...\n")
-    install.packages(pkg, repos = "https://cran.r-project.org")
-    library(pkg, character.only = TRUE)
+    install.packages(
+      pkg,
+      repos = "https://cloud.r-project.org"
+    )
   }
 }
+
+suppressPackageStartupMessages(
+  library(httr)
+)
+
+suppressPackageStartupMessages(
+  library(jsonlite)
+)
+
 
 `%||%` <- function(x, y) {
-  if (is.null(x) || length(x) == 0) y else x
+  if (
+    is.null(x) ||
+    length(x) == 0 ||
+    all(is.na(x))
+  ) {
+    y
+  } else {
+    x
+  }
 }
 
-omim_base_url <- "https://api.omim.org/api"
 
-get_api_key <- function(args) {
-  if (length(args) >= 2 && nzchar(args[2])) {
-    return(args[2])
+# ============================================================================
+# Configuration
+# ============================================================================
+
+OMIM_API_BASE <- "https://api.omim.org/api"
+
+MIM2GENE_URL <- paste0(
+  "https://ftp.ncbi.nlm.nih.gov/",
+  "gene/DATA/mim2gene_medgen"
+)
+
+OMIM_HPO_URL <- paste0(
+  "https://ftp.ncbi.nlm.nih.gov/",
+  "pub/medgen/MedGen_HPO_OMIM_Mapping.txt.gz"
+)
+
+GENE_INFO_URL <- paste0(
+  "https://ftp.ncbi.nlm.nih.gov/",
+  "gene/DATA/GENE_INFO/Mammalia/",
+  "Homo_sapiens.gene_info.gz"
+)
+
+CACHE_DIR <- "omim_cache"
+
+if (!dir.exists(CACHE_DIR)) {
+  dir.create(
+    CACHE_DIR,
+    recursive = TRUE
+  )
+}
+
+CACHE_MAX_AGE_DAYS <- 7
+
+
+# ============================================================================
+# CLI
+# ============================================================================
+
+args <- commandArgs(
+  trailingOnly = TRUE
+)
+
+if (length(args) < 1) {
+
+  cat(
+    paste0(
+      "\nOMIM structured gene downloader\n\n",
+      "Usage:\n",
+      "  Rscript omim.R <phenotype>\n",
+      "  Rscript omim.R <phenotype> --refresh\n\n",
+      "Optional OMIM API:\n",
+      "  export OMIM_API_KEY='your_key'\n",
+      "  Rscript omim.R migraine\n\n"
+    )
+  )
+
+  quit(
+    status = 1
+  )
+}
+
+
+flags <- args[
+  grepl(
+    "^--",
+    args
+  )
+]
+
+positional <- args[
+  !grepl(
+    "^--",
+    args
+  )
+]
+
+phenotype <- positional[1]
+
+refresh_requested <- (
+  "--refresh"
+  %in%
+  flags
+)
+
+api_key <- Sys.getenv(
+  "OMIM_API_KEY",
+  unset = ""
+)
+
+if (
+  length(positional) >= 2 &&
+  nzchar(positional[2])
+) {
+  api_key <- positional[2]
+}
+
+
+# ============================================================================
+# Utilities
+# ============================================================================
+
+normalise_text <- function(x) {
+
+  x <- as.character(x)
+
+  x[is.na(x)] <- ""
+
+  x <- tolower(x)
+
+  x <- gsub(
+    "[^a-z0-9]+",
+    " ",
+    x
+  )
+
+  x <- gsub(
+    "\\s+",
+    " ",
+    x
+  )
+
+  trimws(x)
+}
+
+
+clean_phenotype_filename <- function(x) {
+
+  x <- gsub(
+    "[^[:alnum:]_ -]",
+    "",
+    x
+  )
+
+  x <- gsub(
+    "\\s+",
+    "_",
+    trimws(x)
+  )
+
+  x
+}
+
+
+file_is_fresh <- function(
+  path,
+  max_age_days = CACHE_MAX_AGE_DAYS
+) {
+
+  if (!file.exists(path)) {
+    return(FALSE)
   }
 
-  env_key <- Sys.getenv("OMIM_API_KEY", unset = "")
-  if (nzchar(env_key)) {
-    return(env_key)
+  age <- as.numeric(
+    difftime(
+      Sys.time(),
+      file.mtime(path),
+      units = "days"
+    )
+  )
+
+  (
+    !is.na(age) &&
+    age <= max_age_days
+  )
+}
+
+
+download_file_safe <- function(
+  url,
+  destination,
+  refresh = FALSE
+) {
+
+  if (
+    !refresh &&
+    file_is_fresh(destination)
+  ) {
+
+    cat(
+      "   Using cached:",
+      destination,
+      "\n"
+    )
+
+    return(destination)
   }
 
-  ""
-}
-
-build_search_terms <- function(phenotype) {
-  p <- tolower(trimws(phenotype))
-
-  if (p == "migraine") {
-    return(unique(c(
-      "migraine",
-      "\"migraine with aura\"",
-      "\"migraine without aura\"",
-      "\"familial hemiplegic migraine\"",
-      "\"hemiplegic migraine\""
-    )))
-  }
-
-  unique(c(
-    phenotype,
-    paste(phenotype, "disease"),
-    paste(phenotype, "syndrome"),
-    paste("familial", phenotype)
-  ))
-}
-
-safe_get_text <- function(x) {
-  if (is.null(x) || length(x) == 0) return("")
-  as.character(x)
-}
-
-# ─────────────────────────────────────────────
-# API path
-# ─────────────────────────────────────────────
-omim_get <- function(path, query = list(), api_key) {
-  url <- paste0(omim_base_url, path)
+  cat(
+    "   Downloading:",
+    url,
+    "\n"
+  )
 
   response <- tryCatch(
     GET(
       url,
-      query = c(query, list(format = "json")),
       add_headers(
-        ApiKey = api_key,
-        `Accept-Encoding` = "gzip",
-        `User-Agent` = "R-OMIM-API-GeneDownloader/1.0"
+        `User-Agent` =
+          "PhenotypeToGeneDownloaderR/OMIM-MedGen"
       ),
-      timeout(60)
+      timeout(300)
     ),
     error = function(e) {
-      stop("Request failed: ", conditionMessage(e))
+      cat(
+        "   Download error:",
+        conditionMessage(e),
+        "\n"
+      )
+      NULL
     }
   )
 
-  status <- status_code(response)
+  if (is.null(response)) {
+    return(NULL)
+  }
 
-  if (status != 200) {
-    body_text <- tryCatch(
-      content(response, "text", encoding = "UTF-8"),
-      error = function(e) ""
+  if (status_code(response) != 200) {
+
+    cat(
+      "   HTTP status:",
+      status_code(response),
+      "\n"
     )
-    stop(
-      "OMIM API request failed. HTTP ", status,
-      if (nzchar(body_text)) paste0("\n", body_text) else ""
+
+    return(NULL)
+  }
+
+  raw_data <- content(
+    response,
+    as = "raw"
+  )
+
+  writeBin(
+    raw_data,
+    destination
+  )
+
+  if (
+    !file.exists(destination) ||
+    file.info(destination)$size < 100
+  ) {
+
+    cat(
+      "   Invalid downloaded file:",
+      destination,
+      "\n"
+    )
+
+    return(NULL)
+  }
+
+  cat(
+    "   Saved:",
+    destination,
+    "(",
+    file.info(destination)$size,
+    "bytes )\n"
+  )
+
+  destination
+}
+
+
+find_existing_or_cache <- function(
+  root_name,
+  cache_name
+) {
+
+  candidates <- c(
+    root_name,
+    file.path(
+      CACHE_DIR,
+      cache_name
+    )
+  )
+
+  for (candidate in candidates) {
+
+    if (
+      file.exists(candidate) &&
+      file.info(candidate)$size > 100
+    ) {
+
+      return(candidate)
+    }
+  }
+
+  NULL
+}
+
+
+# ============================================================================
+# Bulk data acquisition
+# ============================================================================
+
+prepare_bulk_files <- function(
+  refresh = FALSE
+) {
+
+  cat(
+    "\nPreparing structured OMIM/MedGen files...\n"
+  )
+
+  # --------------------------------------------------------------------------
+  # mim2gene_medgen
+  # --------------------------------------------------------------------------
+
+  root_mim <- (
+    if (file.exists("mim2gene_medgen"))
+      "mim2gene_medgen"
+    else
+      NULL
+  )
+
+  mim_file <- root_mim
+
+  if (
+    is.null(mim_file) ||
+    refresh
+  ) {
+
+    mim_file <- download_file_safe(
+      MIM2GENE_URL,
+      file.path(
+        CACHE_DIR,
+        "mim2gene_medgen"
+      ),
+      refresh = refresh
     )
   }
 
-  content(response, as = "parsed", type = "application/json", simplifyVector = FALSE)
+  if (
+    is.null(mim_file) ||
+    !file.exists(mim_file)
+  ) {
+
+    stop(
+      "mim2gene_medgen is unavailable."
+    )
+  }
+
+
+  # --------------------------------------------------------------------------
+  # OMIM-HPO mapping
+  # --------------------------------------------------------------------------
+
+  root_map <- (
+    if (
+      file.exists(
+        "MedGen_HPO_OMIM_Mapping.txt.gz"
+      )
+    )
+      "MedGen_HPO_OMIM_Mapping.txt.gz"
+    else
+      NULL
+  )
+
+  mapping_file <- root_map
+
+  if (
+    is.null(mapping_file) ||
+    refresh
+  ) {
+
+    mapping_file <- download_file_safe(
+      OMIM_HPO_URL,
+      file.path(
+        CACHE_DIR,
+        "MedGen_HPO_OMIM_Mapping.txt.gz"
+      ),
+      refresh = refresh
+    )
+  }
+
+  if (
+    is.null(mapping_file) ||
+    !file.exists(mapping_file)
+  ) {
+
+    stop(
+      paste(
+        "MedGen_HPO_OMIM_Mapping.txt.gz",
+        "is unavailable."
+      )
+    )
+  }
+
+
+  # --------------------------------------------------------------------------
+  # Human gene_info
+  # --------------------------------------------------------------------------
+
+  root_gene_info <- (
+    if (
+      file.exists(
+        "Homo_sapiens.gene_info.gz"
+      )
+    )
+      "Homo_sapiens.gene_info.gz"
+    else
+      NULL
+  )
+
+  gene_info_file <- root_gene_info
+
+  if (
+    is.null(gene_info_file) ||
+    refresh
+  ) {
+
+    gene_info_file <- download_file_safe(
+      GENE_INFO_URL,
+      file.path(
+        CACHE_DIR,
+        "Homo_sapiens.gene_info.gz"
+      ),
+      refresh = refresh
+    )
+  }
+
+  if (
+    is.null(gene_info_file) ||
+    !file.exists(gene_info_file)
+  ) {
+
+    stop(
+      "Homo_sapiens.gene_info.gz is unavailable."
+    )
+  }
+
+
+  list(
+    mim2gene = mim_file,
+    mapping = mapping_file,
+    gene_info = gene_info_file
+  )
 }
 
-extract_api_rows_from_entry <- function(entry_wrapper, search_term, phenotype) {
-  entry <- entry_wrapper$entry %||% NULL
-  if (is.null(entry)) return(list())
 
-  mim_number <- entry$mimNumber %||% NA
-  title <- entry$titles$preferredTitle %||% NA
-  gene_map_list <- entry$geneMapList %||% list()
+# ============================================================================
+# Parsers
+# ============================================================================
 
-  if (length(gene_map_list) == 0) return(list())
+load_mim2gene <- function(path) {
+
+  cat(
+    "Loading mim2gene_medgen...\n"
+  )
+
+  df <- read.delim(
+    path,
+    header = TRUE,
+    sep = "\t",
+    quote = "",
+    comment.char = "",
+    stringsAsFactors = FALSE,
+    check.names = FALSE,
+    fill = TRUE
+  )
+
+  if (ncol(df) < 5) {
+
+    stop(
+      "Unexpected mim2gene_medgen format."
+    )
+  }
+
+  colnames(df)[1] <- "MIM_Number"
+
+  expected <- c(
+    "MIM_Number",
+    "GeneID",
+    "type",
+    "Source",
+    "MedGenCUI"
+  )
+
+  missing <- setdiff(
+    expected,
+    colnames(df)
+  )
+
+  if (length(missing) > 0) {
+
+    stop(
+      paste(
+        "mim2gene_medgen missing columns:",
+        paste(
+          missing,
+          collapse = ", "
+        )
+      )
+    )
+  }
+
+
+  df$MIM_Number <- trimws(
+    as.character(
+      df$MIM_Number
+    )
+  )
+
+  df$GeneID <- trimws(
+    as.character(
+      df$GeneID
+    )
+  )
+
+  df$type <- trimws(
+    as.character(
+      df$type
+    )
+  )
+
+  df$Source <- trimws(
+    as.character(
+      df$Source
+    )
+  )
+
+
+  # We want phenotype -> gene relationships.
+  #
+  # GeneMap is retained deliberately. This avoids treating ordinary
+  # OMIM gene records as disease associations.
+
+  keep <- (
+    tolower(df$type) ==
+      "phenotype"
+  ) &
+    df$GeneID != "-" &
+    nzchar(df$GeneID) &
+    df$Source == "GeneMap"
+
+
+  df <- df[
+    keep,
+    ,
+    drop = FALSE
+  ]
+
+
+  df <- df[
+    !duplicated(
+      paste(
+        df$MIM_Number,
+        df$GeneID,
+        sep = "|"
+      )
+    ),
+    ,
+    drop = FALSE
+  ]
+
+
+  cat(
+    "   Structured OMIM phenotype-gene relationships:",
+    nrow(df),
+    "\n"
+  )
+
+  df
+}
+
+
+load_omim_mapping <- function(path) {
+
+  cat(
+    "Loading MedGen HPO/OMIM mapping...\n"
+  )
+
+  con <- gzfile(
+    path,
+    open = "rt"
+  )
+
+  on.exit(
+    close(con),
+    add = TRUE
+  )
+
+  df <- read.delim(
+    con,
+    header = TRUE,
+    sep = "|",
+    quote = "",
+    comment.char = "",
+    stringsAsFactors = FALSE,
+    check.names = FALSE,
+    fill = TRUE
+  )
+
+
+  # First field starts with '#'.
+  if (
+    "#OMIM_CUI"
+    %in%
+    colnames(df)
+  ) {
+
+    colnames(df)[
+      colnames(df) ==
+        "#OMIM_CUI"
+    ] <- "OMIM_CUI"
+  }
+
+
+  required <- c(
+    "OMIM_CUI",
+    "MIM_number",
+    "OMIM_name",
+    "relationship",
+    "HPO_ID",
+    "HPO_name"
+  )
+
+
+  missing <- setdiff(
+    required,
+    colnames(df)
+  )
+
+  if (length(missing) > 0) {
+
+    stop(
+      paste(
+        "OMIM mapping missing columns:",
+        paste(
+          missing,
+          collapse = ", "
+        )
+      )
+    )
+  }
+
+
+  df$MIM_number <- trimws(
+    as.character(
+      df$MIM_number
+    )
+  )
+
+  df$OMIM_name <- trimws(
+    as.character(
+      df$OMIM_name
+    )
+  )
+
+  df$HPO_name <- trimws(
+    as.character(
+      df$HPO_name
+    )
+  )
+
+  df$OMIM_name_norm <- normalise_text(
+    df$OMIM_name
+  )
+
+  df$HPO_name_norm <- normalise_text(
+    df$HPO_name
+  )
+
+
+  cat(
+    "   OMIM/HPO mapping rows:",
+    nrow(df),
+    "\n"
+  )
+
+  df
+}
+
+
+load_gene_info <- function(path) {
+
+  cat(
+    "Loading NCBI human gene_info...\n"
+  )
+
+  con <- gzfile(
+    path,
+    open = "rt"
+  )
+
+  on.exit(
+    close(con),
+    add = TRUE
+  )
+
+  df <- read.delim(
+    con,
+    header = TRUE,
+    sep = "\t",
+    quote = "",
+    comment.char = "",
+    stringsAsFactors = FALSE,
+    check.names = FALSE,
+    fill = TRUE
+  )
+
+
+  if (
+    "#tax_id"
+    %in%
+    colnames(df)
+  ) {
+
+    colnames(df)[
+      colnames(df) ==
+        "#tax_id"
+    ] <- "tax_id"
+  }
+
+
+  required <- c(
+    "GeneID",
+    "Symbol"
+  )
+
+  missing <- setdiff(
+    required,
+    colnames(df)
+  )
+
+  if (length(missing) > 0) {
+
+    stop(
+      paste(
+        "gene_info missing columns:",
+        paste(
+          missing,
+          collapse = ", "
+        )
+      )
+    )
+  }
+
+
+  if (
+    "tax_id"
+    %in%
+    colnames(df)
+  ) {
+
+    df <- df[
+      as.character(df$tax_id) ==
+        "9606",
+      ,
+      drop = FALSE
+    ]
+  }
+
+
+  df$GeneID <- as.character(
+    df$GeneID
+  )
+
+  df$Symbol <- trimws(
+    as.character(
+      df$Symbol
+    )
+  )
+
+
+  keep_columns <- intersect(
+    c(
+      "GeneID",
+      "Symbol",
+      "description",
+      "Synonyms"
+    ),
+    colnames(df)
+  )
+
+
+  df <- df[
+    ,
+    keep_columns,
+    drop = FALSE
+  ]
+
+
+  df <- df[
+    !duplicated(
+      df$GeneID
+    ),
+    ,
+    drop = FALSE
+  ]
+
+
+  cat(
+    "   Human genes loaded:",
+    nrow(df),
+    "\n"
+  )
+
+  df
+}
+
+
+# ============================================================================
+# Structured phenotype matching
+# ============================================================================
+
+find_direct_omim_matches <- function(
+  phenotype,
+  mapping
+) {
+
+  query <- normalise_text(
+    phenotype
+  )
+
+
+  if (!nzchar(query)) {
+
+    return(
+      data.frame()
+    )
+  }
+
+
+  # --------------------------------------------------------------------------
+  # Tier 1: exact OMIM disease-name match
+  # --------------------------------------------------------------------------
+
+  exact <- mapping[
+    mapping$OMIM_name_norm ==
+      query,
+    ,
+    drop = FALSE
+  ]
+
+
+  if (nrow(exact) > 0) {
+
+    exact$Match_Type <- (
+      "OMIM_DISEASE_NAME_EXACT"
+    )
+
+    exact$Match_Score <- 1.00
+  }
+
+
+  # --------------------------------------------------------------------------
+  # Tier 2: OMIM disease name contains complete query phrase.
+  #
+  # Example:
+  # migraine
+  # -> FAMILIAL HEMIPLEGIC MIGRAINE
+  #
+  # This is still disease-name matching, not HPO-feature expansion.
+  # --------------------------------------------------------------------------
+
+  query_pattern <- paste0(
+    "(^| )",
+    gsub(
+      "([][{}()+*^$|\\\\?.])",
+      "\\\\\\1",
+      query
+    ),
+    "( |$)"
+  )
+
+
+  contains_idx <- grepl(
+    query_pattern,
+    mapping$OMIM_name_norm,
+    perl = TRUE
+  )
+
+
+  contains <- mapping[
+    contains_idx,
+    ,
+    drop = FALSE
+  ]
+
+
+  if (nrow(contains) > 0) {
+
+    contains$Match_Type <- (
+      "OMIM_DISEASE_NAME_CONTAINS"
+    )
+
+    contains$Match_Score <- 0.90
+  }
+
+
+  # --------------------------------------------------------------------------
+  # Combine exact + contains only.
+  #
+  # We intentionally DO NOT use an HPO feature match in the default OMIM
+  # genes list because that would make the OMIM module partly dependent
+  # on HPO annotations and would contaminate leave-source-out validation.
+  # --------------------------------------------------------------------------
+
+  pieces <- list()
+
+  if (nrow(exact) > 0) {
+    pieces[[length(pieces) + 1]] <- exact
+  }
+
+  if (nrow(contains) > 0) {
+    pieces[[length(pieces) + 1]] <- contains
+  }
+
+
+  if (length(pieces) == 0) {
+
+    return(
+      data.frame()
+    )
+  }
+
+
+  out <- do.call(
+    rbind,
+    pieces
+  )
+
+
+  out <- out[
+    order(
+      -out$Match_Score,
+      out$OMIM_name,
+      out$MIM_number
+    ),
+    ,
+    drop = FALSE
+  ]
+
+
+  # If same MIM appears through exact and contains,
+  # retain strongest match.
+
+  out <- out[
+    !duplicated(
+      out$MIM_number
+    ),
+    ,
+    drop = FALSE
+  ]
+
+
+  rownames(out) <- NULL
+
+  out
+}
+
+
+# ============================================================================
+# Join OMIM phenotype MIM numbers to GeneMap relationships
+# ============================================================================
+
+build_medgen_results <- function(
+  phenotype,
+  mapping,
+  mim2gene,
+  gene_info
+) {
+
+  matches <- find_direct_omim_matches(
+    phenotype,
+    mapping
+  )
+
+
+  if (nrow(matches) == 0) {
+
+    cat(
+      "   No direct OMIM disease-name matches.\n"
+    )
+
+    return(
+      data.frame()
+    )
+  }
+
+
+  cat(
+    "   Matched OMIM disorders:",
+    nrow(matches),
+    "\n"
+  )
+
+
+  preview_n <- min(
+    10,
+    nrow(matches)
+  )
+
+
+  for (
+    i in seq_len(preview_n)
+  ) {
+
+    cat(
+      "      ",
+      matches$MIM_number[i],
+      " | ",
+      matches$OMIM_name[i],
+      " | ",
+      matches$Match_Type[i],
+      "\n",
+      sep = ""
+    )
+  }
+
+
+  relationships <- merge(
+    matches,
+    mim2gene,
+    by.x = "MIM_number",
+    by.y = "MIM_Number",
+    all = FALSE
+  )
+
+
+  if (nrow(relationships) == 0) {
+
+    cat(
+      "   Matched OMIM disorders had no GeneMap relationships.\n"
+    )
+
+    return(
+      data.frame()
+    )
+  }
+
+
+  relationships$GeneID <- as.character(
+    relationships$GeneID
+  )
+
+
+  relationships <- merge(
+    relationships,
+    gene_info,
+    by = "GeneID",
+    all.x = TRUE
+  )
+
+
+  relationships <- relationships[
+    !is.na(
+      relationships$Symbol
+    ) &
+      nzchar(
+        relationships$Symbol
+      ),
+    ,
+    drop = FALSE
+  ]
+
+
+  if (nrow(relationships) == 0) {
+
+    cat(
+      "   Gene IDs could not be mapped to human symbols.\n"
+    )
+
+    return(
+      data.frame()
+    )
+  }
+
+
+  retrieval_time <- format(
+    Sys.time(),
+    "%Y-%m-%dT%H:%M:%S%z"
+  )
+
+
+  gene_name <- rep(
+    "",
+    nrow(relationships)
+  )
+
+
+  if (
+    "description"
+    %in%
+    colnames(relationships)
+  ) {
+
+    gene_name <- as.character(
+      relationships$description
+    )
+  }
+
+
+  result <- data.frame(
+
+    Gene_Symbol =
+      relationships$Symbol,
+
+    Gene_Name =
+      gene_name,
+
+    MIM_Number =
+      relationships$MIM_number,
+
+    Entry_Title =
+      relationships$OMIM_name,
+
+    Search_Term =
+      phenotype,
+
+    Phenotype_Map =
+      relationships$OMIM_name,
+
+    Inheritance =
+      "",
+
+    Entrez_GeneIDs =
+      relationships$GeneID,
+
+    Ensembl_IDs =
+      "",
+
+    Source =
+      "OMIM_DERIVED_MEDGEN_GENE_MAP",
+
+    input_term =
+      phenotype,
+
+    matched_term =
+      relationships$OMIM_name,
+
+    matched_identifier =
+      paste0(
+        "OMIM:",
+        relationships$MIM_number
+      ),
+
+    matched_ontology =
+      "OMIM",
+
+    source_release =
+      paste0(
+        "NCBI_MedGen_",
+        format(
+          Sys.Date(),
+          "%Y-%m-%d"
+        )
+      ),
+
+    source_record_id =
+      relationships$MIM_number,
+
+    gene_symbol_original =
+      relationships$Symbol,
+
+    gene_symbol_current =
+      relationships$Symbol,
+
+    gene_identifier =
+      paste0(
+        "NCBIGene:",
+        relationships$GeneID
+      ),
+
+    evidence_class =
+      "curated_clinical",
+
+    association_type =
+      "OMIM_gene_disease_map",
+
+    source_score =
+      relationships$Match_Score,
+
+    source_rank =
+      NA_integer_,
+
+    query_method =
+      relationships$Match_Type,
+
+    retrieval_timestamp =
+      retrieval_time,
+
+    MedGen_CUI =
+      relationships$MedGenCUI,
+
+    OMIM_CUI =
+      relationships$OMIM_CUI,
+
+    HPO_ID_context =
+      relationships$HPO_ID,
+
+    HPO_name_context =
+      relationships$HPO_name,
+
+    stringsAsFactors = FALSE
+  )
+
+
+  result <- result[
+    order(
+      -result$source_score,
+      result$Entry_Title,
+      result$Gene_Symbol
+    ),
+    ,
+    drop = FALSE
+  ]
+
+
+  result <- result[
+    !duplicated(
+      paste(
+        result$Gene_Symbol,
+        result$MIM_Number,
+        sep = "|"
+      )
+    ),
+    ,
+    drop = FALSE
+  ]
+
+
+  # Source rank after deterministic ordering.
+
+  result$source_rank <- seq_len(
+    nrow(result)
+  )
+
+
+  rownames(result) <- NULL
+
+
+  cat(
+    "   Structured gene-disease rows:",
+    nrow(result),
+    "\n"
+  )
+
+  cat(
+    "   Unique genes:",
+    length(
+      unique(
+        result$Gene_Symbol
+      )
+    ),
+    "\n"
+  )
+
+
+  result
+}
+
+
+# ============================================================================
+# Optional OMIM API path
+# ============================================================================
+
+safe_text <- function(x) {
+
+  if (
+    is.null(x) ||
+    length(x) == 0
+  ) {
+    return("")
+  }
+
+  as.character(x)
+}
+
+
+omim_get <- function(
+  path,
+  query = list(),
+  api_key
+) {
+
+  url <- paste0(
+    OMIM_API_BASE,
+    path
+  )
+
+
+  response <- GET(
+    url,
+    query = c(
+      query,
+      list(
+        format = "json"
+      )
+    ),
+    add_headers(
+      ApiKey = api_key,
+      `Accept-Encoding` = "gzip",
+      `User-Agent` =
+        "PhenotypeToGeneDownloaderR-OMIM/2.0"
+    ),
+    timeout(60)
+  )
+
+
+  if (
+    status_code(response) != 200
+  ) {
+
+    stop(
+      "OMIM API HTTP ",
+      status_code(response)
+    )
+  }
+
+
+  content(
+    response,
+    as = "parsed",
+    type = "application/json",
+    simplifyVector = FALSE
+  )
+}
+
+
+extract_api_rows <- function(
+  wrapper,
+  phenotype
+) {
+
+  entry <- wrapper$entry %||% NULL
+
+  if (is.null(entry)) {
+    return(list())
+  }
+
+
+  mim <- entry$mimNumber %||% NA
+
+  title <- (
+    entry$titles$preferredTitle
+    %||%
+    ""
+  )
+
+
+  maps <- (
+    entry$geneMapList
+    %||%
+    list()
+  )
+
 
   rows <- list()
 
-  for (gm_wrap in gene_map_list) {
-    gm <- gm_wrap$geneMap %||% NULL
-    if (is.null(gm)) next
 
-    approved_symbols <- safe_get_text(gm$approvedGeneSymbols)
-    fallback_symbols <- safe_get_text(gm$geneSymbols)
-    gene_name <- safe_get_text(gm$geneName)
-    entrez_ids <- safe_get_text(gm$geneIDs)
-    ensembl_ids <- safe_get_text(gm$ensemblIDs)
+  for (gm_wrapper in maps) {
 
-    raw_symbols <- if (nzchar(approved_symbols)) approved_symbols else fallback_symbols
-    if (!nzchar(raw_symbols)) next
+    gm <- (
+      gm_wrapper$geneMap
+      %||%
+      NULL
+    )
 
-    symbols <- unique(trimws(unlist(strsplit(raw_symbols, ","))))
-    symbols <- symbols[nzchar(symbols)]
-
-    phenotype_map_list <- gm$phenotypeMapList %||% list()
-    phenotype_texts <- character()
-    inheritance_texts <- character()
-
-    if (length(phenotype_map_list) > 0) {
-      for (pm_wrap in phenotype_map_list) {
-        pm <- pm_wrap$phenotypeMap %||% NULL
-        if (is.null(pm)) next
-        phenotype_texts <- c(phenotype_texts, safe_get_text(pm$phenotype))
-        inheritance_texts <- c(inheritance_texts, safe_get_text(pm$phenotypeInheritance))
-      }
+    if (is.null(gm)) {
+      next
     }
 
-    phenotype_texts <- unique(trimws(phenotype_texts[nzchar(phenotype_texts)]))
-    inheritance_texts <- unique(trimws(inheritance_texts[nzchar(inheritance_texts)]))
 
-    phenotype_map_text <- paste(phenotype_texts, collapse = "; ")
-    inheritance_text <- paste(inheritance_texts, collapse = "; ")
+    symbols <- safe_text(
+      gm$approvedGeneSymbols
+    )
 
-    keep_entry <- TRUE
-    if (nzchar(phenotype_map_text)) {
-      keep_entry <- str_detect(
-        tolower(phenotype_map_text),
-        fixed(tolower(phenotype))
+
+    if (!nzchar(symbols)) {
+
+      symbols <- safe_text(
+        gm$geneSymbols
       )
     }
 
-    if (!keep_entry) next
 
-    for (sym in symbols) {
+    if (!nzchar(symbols)) {
+      next
+    }
+
+
+    symbols <- unique(
+      trimws(
+        unlist(
+          strsplit(
+            symbols,
+            ","
+          )
+        )
+      )
+    )
+
+
+    symbols <- symbols[
+      nzchar(symbols)
+    ]
+
+
+    for (gene in symbols) {
+
       rows[[length(rows) + 1]] <- data.frame(
-        Gene_Symbol = sym,
-        Gene_Name = gene_name,
-        MIM_Number = as.character(mim_number),
-        Entry_Title = as.character(title),
-        Search_Term = as.character(search_term),
-        Phenotype_Map = phenotype_map_text,
-        Inheritance = inheritance_text,
-        Entrez_GeneIDs = entrez_ids,
-        Ensembl_IDs = ensembl_ids,
-        Source = "OMIM_API",
+
+        Gene_Symbol =
+          gene,
+
+        Gene_Name =
+          safe_text(
+            gm$geneName
+          ),
+
+        MIM_Number =
+          as.character(mim),
+
+        Entry_Title =
+          as.character(title),
+
+        Search_Term =
+          phenotype,
+
+        Phenotype_Map =
+          as.character(title),
+
+        Inheritance =
+          "",
+
+        Entrez_GeneIDs =
+          safe_text(
+            gm$geneIDs
+          ),
+
+        Ensembl_IDs =
+          safe_text(
+            gm$ensemblIDs
+          ),
+
+        Source =
+          "OMIM_API",
+
+        input_term =
+          phenotype,
+
+        matched_term =
+          as.character(title),
+
+        matched_identifier =
+          paste0(
+            "OMIM:",
+            mim
+          ),
+
+        matched_ontology =
+          "OMIM",
+
+        source_release =
+          paste0(
+            "OMIM_API_",
+            format(
+              Sys.Date(),
+              "%Y-%m-%d"
+            )
+          ),
+
+        source_record_id =
+          as.character(mim),
+
+        gene_symbol_original =
+          gene,
+
+        gene_symbol_current =
+          gene,
+
+        gene_identifier =
+          safe_text(
+            gm$geneIDs
+          ),
+
+        evidence_class =
+          "curated_clinical",
+
+        association_type =
+          "OMIM_gene_disease_map",
+
+        source_score =
+          1,
+
+        source_rank =
+          NA_integer_,
+
+        query_method =
+          "OMIM_API_entry_search",
+
+        retrieval_timestamp =
+          format(
+            Sys.time(),
+            "%Y-%m-%dT%H:%M:%S%z"
+          ),
+
+        MedGen_CUI =
+          "",
+
+        OMIM_CUI =
+          "",
+
+        HPO_ID_context =
+          "",
+
+        HPO_name_context =
+          "",
+
         stringsAsFactors = FALSE
       )
     }
   }
 
+
   rows
 }
 
-search_omim_api <- function(term, phenotype, api_key, max_results = 200) {
-  cat("🔑 API search:", term, "\n")
 
-  batch_size <- 20
-  start <- 0
-  collected <- list()
+run_api_mode <- function(
+  phenotype,
+  api_key
+) {
 
-  repeat {
-    resp <- omim_get(
-      path = "/entry/search",
+  if (!nzchar(api_key)) {
+
+    cat(
+      "No OMIM API key available; using structured NCBI fallback.\n"
+    )
+
+    return(
+      data.frame()
+    )
+  }
+
+
+  cat(
+    "Trying OMIM API first...\n"
+  )
+
+
+  result <- tryCatch({
+
+    response <- omim_get(
+      "/entry/search",
       query = list(
-        search = term,
+        search = phenotype,
         include = "geneMap",
         sort = "score desc",
-        start = start,
-        limit = batch_size
+        start = 0,
+        limit = 100
       ),
       api_key = api_key
     )
 
-    entry_list <- resp$omim$searchResponse$entryList %||% list()
-    total_results <- resp$omim$searchResponse$totalResults %||% 0
 
-    if (length(entry_list) == 0) break
-
-    cat("   Retrieved", length(entry_list), "entries (start =", start, "of", total_results, ")\n")
-
-    for (entry_wrapper in entry_list) {
-      rows <- extract_api_rows_from_entry(entry_wrapper, term, phenotype)
-      if (length(rows) > 0) {
-        collected <- c(collected, rows)
-      }
-    }
-
-    start <- start + length(entry_list)
-
-    if (length(entry_list) < batch_size) break
-    if (start >= total_results) break
-    if (start >= max_results) break
-
-    Sys.sleep(0.25)
-  }
-
-  if (length(collected) == 0) return(data.frame())
-
-  out <- do.call(rbind, collected)
-  out <- out[!duplicated(out[, c("Gene_Symbol", "MIM_Number", "Entry_Title")]), , drop = FALSE]
-  rownames(out) <- NULL
-  out
-}
-
-run_api_mode <- function(phenotype, api_key) {
-  if (!nzchar(api_key)) {
-    cat("ℹ️ No OMIM API key found. Skipping API mode.\n")
-    return(data.frame())
-  }
-
-  search_terms <- build_search_terms(phenotype)
-  all_results <- list()
-
-  for (term in search_terms) {
-    term_results <- tryCatch(
-      search_omim_api(term, phenotype, api_key, max_results = 200),
-      error = function(e) {
-        cat("❌ API error for", shQuote(term), ":", conditionMessage(e), "\n")
-        data.frame()
-      }
+    entries <- (
+      response$
+        omim$
+        searchResponse$
+        entryList
+      %||%
+      list()
     )
 
-    if (nrow(term_results) > 0) {
-      all_results[[length(all_results) + 1]] <- term_results
-    }
-  }
 
-  if (length(all_results) == 0) return(data.frame())
+    rows <- list()
 
-  final_df <- do.call(rbind, all_results)
-  final_df <- final_df[!duplicated(final_df[, c("Gene_Symbol", "MIM_Number", "Entry_Title")]), , drop = FALSE]
-  final_df <- final_df[order(final_df$Gene_Symbol), , drop = FALSE]
-  rownames(final_df) <- NULL
-  final_df
-}
 
-# ─────────────────────────────────────────────
-# Scraping fallback
-# ─────────────────────────────────────────────
-extract_candidate_genes_from_text <- function(text_content) {
-  if (!nzchar(text_content)) return(character())
+    for (entry in entries) {
 
-  gene_patterns <- c(
-    "\\b[A-Z][A-Z0-9]{2,14}\\b",
-    "\\b[A-Z][A-Z0-9-]{2,15}\\b",
-    "\\b[A-Z]{2,}[0-9]+[A-Z]*\\b"
-  )
+      extracted <- extract_api_rows(
+        entry,
+        phenotype
+      )
 
-  exclude_words <- c(
-    "OMIM", "SEARCH", "RESULTS", "PAGE", "HOME", "GENE", "LOCUS",
-    "PHENOTYPE", "SYNDROME", "DISEASE", "DISORDER", "MUTATION",
-    "THE", "AND", "FOR", "WITH", "THAT", "THIS", "FROM", "WERE",
-    "HAVE", "MORE", "TIME", "VERY", "CAN", "HAD", "HER", "WAS",
-    "ONE", "OUR", "OUT", "DAY", "GET", "HAS", "HIM", "HOW", "ITS",
-    "MAY", "NEW", "NOW", "OLD", "SEE", "TWO", "WHO", "DID", "HIS",
-    "LET", "PUT", "SAY", "SHE", "TOO", "USE", "ALL", "ANY", "ARE",
-    "BUT", "NOT", "YOU", "WHAT", "WHEN", "WHERE", "WHY", "ABOUT",
-    "AFTER", "CLINICAL", "MOLECULAR", "GENETICS", "TYPE", "NULL",
-    "TRUE", "FALSE", "LIST", "NEXT", "PREV", "LAST", "FIRST",
-    "SIGN", "ALSO", "BOTH", "SOME", "SUCH", "THAN", "THEN", "THEY",
-    "THUS", "WELL", "WILL", "BEEN", "EACH", "EVEN", "INTO",
-    "ONLY", "SAME", "SHOW", "THEM", "THESE", "THEIR", "THERE"
-  )
+      if (length(extracted) > 0) {
 
-  matches <- character()
-  for (pattern in gene_patterns) {
-    matches <- c(matches, str_extract_all(text_content, pattern)[[1]])
-  }
-
-  matches <- unique(trimws(matches))
-  matches <- matches[
-    nzchar(matches) &
-    !matches %in% exclude_words &
-    nchar(matches) >= 3 &
-    nchar(matches) <= 15 &
-    !str_detect(matches, "^[0-9]+$") &
-    str_detect(matches, "^[A-Z]") &
-    str_detect(matches, "[A-Z]")
-  ]
-
-  sort(unique(matches))
-}
-
-search_omim_scrape <- function(term, phenotype) {
-  cat("🌐 Scraping search:", term, "\n")
-
-  url <- paste0(
-    "https://www.omim.org/search?search=",
-    URLencode(term, reserved = TRUE),
-    "&sort=score+desc&limit=100"
-  )
-
-  response <- tryCatch(
-    GET(
-      url,
-      add_headers(
-        `User-Agent` = "Mozilla/5.0 (compatible; R-OMIMScraper/1.0; +research)"
-      ),
-      timeout(30)
-    ),
-    error = function(e) {
-      cat("❌ Scraping request failed:", conditionMessage(e), "\n")
-      return(NULL)
-    }
-  )
-
-  if (is.null(response)) return(data.frame())
-
-  if (status_code(response) != 200) {
-    cat("⚠️ Scraping HTTP status:", status_code(response), "\n")
-    return(data.frame())
-  }
-
-  page_content <- content(response, "text", encoding = "UTF-8")
-  doc <- read_html(page_content)
-  text_content <- html_text(doc)
-
-  genes <- extract_candidate_genes_from_text(text_content)
-
-  if (length(genes) == 0) return(data.frame())
-
-  data.frame(
-    Gene_Symbol = genes,
-    Gene_Name = "",
-    MIM_Number = "",
-    Entry_Title = "",
-    Search_Term = term,
-    Phenotype_Map = phenotype,
-    Inheritance = "",
-    Entrez_GeneIDs = "",
-    Ensembl_IDs = "",
-    Source = "OMIM_SCRAPE_FALLBACK",
-    stringsAsFactors = FALSE
-  )
-}
-
-run_scrape_mode <- function(phenotype) {
-  search_terms <- build_search_terms(phenotype)
-  all_results <- list()
-
-  for (term in search_terms) {
-    res <- tryCatch(
-      search_omim_scrape(term, phenotype),
-      error = function(e) {
-        cat("❌ Scraping error for", shQuote(term), ":", conditionMessage(e), "\n")
-        data.frame()
+        rows <- c(
+          rows,
+          extracted
+        )
       }
+    }
+
+
+    if (length(rows) == 0) {
+
+      data.frame()
+
+    } else {
+
+      out <- do.call(
+        rbind,
+        rows
+      )
+
+
+      out <- out[
+        !duplicated(
+          paste(
+            out$Gene_Symbol,
+            out$MIM_Number,
+            sep = "|"
+          )
+        ),
+        ,
+        drop = FALSE
+      ]
+
+
+      out$source_rank <- seq_len(
+        nrow(out)
+      )
+
+
+      out
+    }
+
+  }, error = function(e) {
+
+    cat(
+      "OMIM API failed:",
+      conditionMessage(e),
+      "\n"
     )
 
-    if (nrow(res) > 0) {
-      all_results[[length(all_results) + 1]] <- res
-    }
+    data.frame()
+  })
 
-    Sys.sleep(1)
-  }
 
-  if (length(all_results) == 0) return(data.frame())
-
-  final_df <- do.call(rbind, all_results)
-  final_df <- final_df[!duplicated(final_df[, c("Gene_Symbol", "Search_Term", "Source")]), , drop = FALSE]
-  final_df <- final_df[order(final_df$Gene_Symbol), , drop = FALSE]
-  rownames(final_df) <- NULL
-  final_df
+  result
 }
 
-# ─────────────────────────────────────────────
+
+# ============================================================================
 # Save
-# ─────────────────────────────────────────────
-save_results <- function(df, phenotype) {
+# ============================================================================
+
+save_results <- function(
+  df,
+  phenotype
+) {
+
   output_dir <- "AllPackagesGenes"
+
   if (!dir.exists(output_dir)) {
-    dir.create(output_dir, recursive = TRUE)
+
+    dir.create(
+      output_dir,
+      recursive = TRUE
+    )
   }
 
-  clean_phenotype <- gsub("[^[:alnum:]_ -]", "", phenotype)
-  clean_phenotype <- gsub("\\s+", "_", trimws(clean_phenotype))
 
-  full_file <- file.path(output_dir, paste0(clean_phenotype, "_omim.csv"))
-  genes_file <- file.path(output_dir, paste0(clean_phenotype, "_omim_genes.csv"))
+  clean <- clean_phenotype_filename(
+    phenotype
+  )
 
-  write.csv(df, full_file, row.names = FALSE)
 
-  genes_only <- data.frame(
-    Gene = sort(unique(df$Gene_Symbol)),
+  full_file <- file.path(
+    output_dir,
+    paste0(
+      clean,
+      "_omim.csv"
+    )
+  )
+
+
+  genes_file <- file.path(
+    output_dir,
+    paste0(
+      clean,
+      "_omim_genes.csv"
+    )
+  )
+
+
+  write.csv(
+    df,
+    full_file,
+    row.names = FALSE
+  )
+
+
+  genes <- sort(
+    unique(
+      df$Gene_Symbol
+    )
+  )
+
+
+  gene_df <- data.frame(
+    Gene = genes,
     stringsAsFactors = FALSE
   )
-  write.csv(genes_only, genes_file, row.names = FALSE)
 
-  list(full_file = full_file, genes_file = genes_file, genes_only = genes_only)
+
+  write.csv(
+    gene_df,
+    genes_file,
+    row.names = FALSE
+  )
+
+
+  list(
+    full_file = full_file,
+    genes_file = genes_file,
+    genes = gene_df
+  )
 }
 
-# ─────────────────────────────────────────────
+
+remove_stale_outputs <- function(
+  phenotype
+) {
+
+  clean <- clean_phenotype_filename(
+    phenotype
+  )
+
+
+  targets <- c(
+
+    file.path(
+      "AllPackagesGenes",
+      paste0(
+        clean,
+        "_omim.csv"
+      )
+    ),
+
+    file.path(
+      "AllPackagesGenes",
+      paste0(
+        clean,
+        "_omim_genes.csv"
+      )
+    )
+  )
+
+
+  for (path in targets) {
+
+    if (file.exists(path)) {
+
+      file.remove(path)
+
+      cat(
+        "Removed stale OMIM output:",
+        path,
+        "\n"
+      )
+    }
+  }
+}
+
+
+# ============================================================================
 # Main
-# ─────────────────────────────────────────────
+# ============================================================================
+
 main <- function() {
-  args <- commandArgs(trailingOnly = TRUE)
 
-  if (length(args) < 1) {
-    cat("OMIM Gene Downloader\n")
-    cat("Usage:\n")
-    cat("  export OMIM_API_KEY='your_key_here'\n")
-    cat("  Rscript omim_combined.R <phenotype>\n\n")
-    cat("Or:\n")
-    cat("  Rscript omim_combined.R <phenotype> <api_key>\n")
-    quit(status = 1)
+  cat(
+    "\n============================================================\n"
+  )
+
+  cat(
+    "OMIM STRUCTURED GENE RETRIEVAL\n"
+  )
+
+  cat(
+    "============================================================\n"
+  )
+
+  cat(
+    "Input term:       ",
+    phenotype,
+    "\n"
+  )
+
+  cat(
+    "OMIM API key:     ",
+    ifelse(
+      nzchar(api_key),
+      "available",
+      "not available"
+    ),
+    "\n"
+  )
+
+  cat(
+    "Refresh bulk data:",
+    refresh_requested,
+    "\n"
+  )
+
+  cat(
+    "Start time:       ",
+    format(Sys.time()),
+    "\n\n"
+  )
+
+
+  # Important: old HTML-scraper outputs must not survive.
+
+  remove_stale_outputs(
+    phenotype
+  )
+
+
+  # --------------------------------------------------------------------------
+  # 1. API
+  # --------------------------------------------------------------------------
+
+  result <- run_api_mode(
+    phenotype,
+    api_key
+  )
+
+
+  # --------------------------------------------------------------------------
+  # 2. Structured NCBI fallback
+  # --------------------------------------------------------------------------
+
+  if (nrow(result) == 0) {
+
+    cat(
+      "\nUsing NCBI structured OMIM/MedGen fallback.\n"
+    )
+
+
+    files <- prepare_bulk_files(
+      refresh =
+        refresh_requested
+    )
+
+
+    mim2gene <- load_mim2gene(
+      files$mim2gene
+    )
+
+
+    mapping <- load_omim_mapping(
+      files$mapping
+    )
+
+
+    gene_info <- load_gene_info(
+      files$gene_info
+    )
+
+
+    result <- build_medgen_results(
+      phenotype,
+      mapping,
+      mim2gene,
+      gene_info
+    )
   }
 
-  phenotype <- args[1]
-  api_key <- get_api_key(args)
 
-  cat("🎯 Phenotype:        ", phenotype, "\n")
-  cat("📁 Output directory:  AllPackagesGenes\n")
-  cat("🔑 API key:          ", ifelse(nzchar(api_key), "provided", "not provided"), "\n")
-  cat("⏰ Start time:       ", format(Sys.time()), "\n\n")
+  # --------------------------------------------------------------------------
+  # Outcome
+  # --------------------------------------------------------------------------
 
-  final_df <- data.frame()
+  if (nrow(result) == 0) {
 
-  # Try API first
-  final_df <- run_api_mode(phenotype, api_key)
+    cat(
+      "\nNo structured OMIM gene-disease association ",
+      "was found for: ",
+      phenotype,
+      "\n",
+      sep = ""
+    )
 
-  # Fallback if needed
-  if (nrow(final_df) == 0) {
-    cat("\n⚠️ API mode unavailable or returned no results. Switching to OMIM scraping fallback.\n\n")
-    final_df <- run_scrape_mode(phenotype)
+    cat(
+      "This is a successful no-result query, ",
+      "not an access or parsing failure.\n"
+    )
+
+    cat(
+      "\nEnd time:",
+      format(Sys.time()),
+      "\n"
+    )
+
+    quit(
+      status = 0
+    )
   }
 
-  if (nrow(final_df) == 0) {
-    cat("❌ No genes found for:", phenotype, "\n")
-    cat("\n⏰ End time: ", format(Sys.time()), "\n")
-    quit(status = 0)
-  }
 
-  saved <- save_results(final_df, phenotype)
+  saved <- save_results(
+    result,
+    phenotype
+  )
 
-  cat("\n✅ SUCCESS!\n")
-  cat("📊 Total rows:      ", nrow(final_df), "\n")
-  cat("🧬 Unique genes:     ", nrow(saved$genes_only), "\n")
-  cat("🔧 Method(s):        ", paste(unique(final_df$Source), collapse = ", "), "\n")
-  cat("💾 Full results:     ", saved$full_file, "\n")
-  cat("🧬 Genes-only file:  ", saved$genes_file, "\n\n")
 
-  genes <- saved$genes_only$Gene
-  cat("🧬 Genes found for", phenotype, ":\n")
-  for (i in seq(1, length(genes), by = 8)) {
-    end_idx <- min(i + 7, length(genes))
-    cat("   ", paste(genes[i:end_idx], collapse = ", "), "\n")
-  }
+  cat(
+    "\n============================================================\n"
+  )
 
-  cat("\n⏰ End time: ", format(Sys.time()), "\n")
+  cat(
+    "SUCCESS\n"
+  )
+
+  cat(
+    "============================================================\n"
+  )
+
+  cat(
+    "Rows:         ",
+    nrow(result),
+    "\n"
+  )
+
+  cat(
+    "Unique genes: ",
+    nrow(saved$genes),
+    "\n"
+  )
+
+  cat(
+    "Source:       ",
+    paste(
+      unique(
+        result$Source
+      ),
+      collapse = ", "
+    ),
+    "\n"
+  )
+
+  cat(
+    "Full output:  ",
+    saved$full_file,
+    "\n"
+  )
+
+  cat(
+    "Genes output: ",
+    saved$genes_file,
+    "\n"
+  )
+
+
+  cat(
+    "\nTop genes:\n"
+  )
+
+
+  preview <- head(
+    saved$genes$Gene,
+    30
+  )
+
+
+  cat(
+    paste(
+      preview,
+      collapse = ", "
+    ),
+    "\n"
+  )
+
+
+  cat(
+    "\nEnd time:",
+    format(Sys.time()),
+    "\n"
+  )
 }
 
-if (!interactive()) {
-  main()
-}
+
+main()
+ 

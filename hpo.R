@@ -1,443 +1,1922 @@
+ 
 #!/usr/bin/env Rscript
-# Robust HPO gene downloader
 
-if (!interactive() && is.null(getOption("repos"))) {
-  options(repos = c(CRAN = "https://cloud.r-project.org/"))
+# ============================================================================
+# HPO direct phenotype -> gene downloader
+#
+# FINAL BENCHMARK VERSION
+#
+# Official HPO sources:
+#   - hp.obo
+#   - genes_to_phenotype.txt
+#
+# Resolution:
+#   1. exact HPO ID
+#   2. exact normalized HPO primary term
+#   3. exact normalized official HPO synonym
+#
+# No:
+#   - hardcoded phenotype synonyms
+#   - hardcoded genes
+#   - disease-name expansion
+#   - phenotype.hpoa -> many HPO features -> gene expansion
+#
+# Outputs:
+#   AllPackagesGenes/<phenotype>_hpo.csv
+#   AllPackagesGenes/<phenotype>_hpo_genes.csv
+#   AllPackagesGenes/<phenotype>_hpo_resolution.csv
+#
+# Usage:
+#   Rscript hpo.R migraine
+#   Rscript hpo.R "gastro-oesophageal reflux"
+#   Rscript hpo.R HP:0002076
+# ============================================================================
+
+
+# ----------------------------------------------------------------------------
+# Configuration
+# ----------------------------------------------------------------------------
+
+OUTPUT_DIR <- "AllPackagesGenes"
+
+CACHE_MAX_AGE_DAYS <- 7
+
+HPO_GENE_URL <- paste0(
+  "https://purl.obolibrary.org/obo/",
+  "hp/hpoa/genes_to_phenotype.txt"
+)
+
+HPO_OBO_URL <- paste0(
+  "https://purl.obolibrary.org/obo/",
+  "hp.obo"
+)
+
+HPO_GENE_FILE <- "hpo_genes_to_phenotype.txt"
+HPO_OBO_FILE  <- "hpo_ontology.obo"
+
+
+# ----------------------------------------------------------------------------
+# Packages
+# ----------------------------------------------------------------------------
+
+if (!requireNamespace("httr", quietly = TRUE)) {
+  stop(
+    "Required R package 'httr' is not installed."
+  )
 }
 
-install_if_missing <- function(pkg, bioc = FALSE) {
-  if (!requireNamespace(pkg, quietly = TRUE)) {
-    cat("⚠️  Missing package:", pkg, "- attempting to install\n")
-    if (bioc) {
-      if (!requireNamespace("BiocManager", quietly = TRUE)) {
-        install.packages("BiocManager", repos = "https://cloud.r-project.org/")
-      }
-      BiocManager::install(pkg, ask = FALSE, update = FALSE)
-    } else {
-      install.packages(pkg, repos = "https://cloud.r-project.org/")
-    }
+suppressPackageStartupMessages(
+  library(httr)
+)
+
+
+# ----------------------------------------------------------------------------
+# Basic helpers
+# ----------------------------------------------------------------------------
+
+safe_trim <- function(x) {
+
+  x <- as.character(x)
+
+  x[is.na(x)] <- ""
+
+  trimws(x)
+}
+
+
+clean_filename <- function(x) {
+
+  x <- gsub(
+    "[^A-Za-z0-9_-]",
+    "_",
+    x
+  )
+
+  x <- gsub(
+    "_+",
+    "_",
+    x
+  )
+
+  x <- gsub(
+    "^_|_$",
+    "",
+    x
+  )
+
+  if (!nzchar(x)) {
+    x <- "phenotype"
   }
-  suppressPackageStartupMessages(library(pkg, character.only = TRUE))
+
+  x
 }
 
-required_packages <- c("ontologyIndex", "httr", "utils")
-for (pkg in required_packages) install_if_missing(pkg)
 
-safe_read_tsv <- function(path, comment = "#") {
-  tryCatch(
+normalize_text <- function(x) {
+
+  x <- safe_trim(x)
+
+  x <- tolower(x)
+
+  # Generic spelling normalization only.
+  # These are not phenotype-specific aliases.
+
+  x <- gsub(
+    "oesoph",
+    "esoph",
+    x
+  )
+
+  x <- gsub(
+    "tumour",
+    "tumor",
+    x
+  )
+
+  x <- gsub(
+    "[^a-z0-9]+",
+    " ",
+    x
+  )
+
+  x <- gsub(
+    "\\s+",
+    " ",
+    x
+  )
+
+  trimws(x)
+}
+
+
+file_is_fresh <- function(
+  path,
+  max_age_days = CACHE_MAX_AGE_DAYS
+) {
+
+  if (!file.exists(path)) {
+    return(FALSE)
+  }
+
+  age <- as.numeric(
+    difftime(
+      Sys.time(),
+      file.mtime(path),
+      units = "days"
+    )
+  )
+
+  (
+    !is.na(age) &&
+    age <= max_age_days
+  )
+}
+
+
+# ----------------------------------------------------------------------------
+# Download source files
+# ----------------------------------------------------------------------------
+
+download_file_if_needed <- function(
+  url,
+  destination
+) {
+
+  if (
+    file_is_fresh(destination)
+  ) {
+
+    cat(
+      "Using cached file:",
+      destination,
+      "\n"
+    )
+
+    return(destination)
+  }
+
+
+  cat(
+    "Downloading:",
+    url,
+    "\n"
+  )
+
+
+  response <- tryCatch(
+
+    httr::GET(
+      url,
+      httr::add_headers(
+        `User-Agent` =
+          "PhenotypeToGeneDownloaderR-HPO/3.0"
+      ),
+      httr::timeout(300)
+    ),
+
+    error = function(e) {
+
+      cat(
+        "access_failure:",
+        conditionMessage(e),
+        "\n"
+      )
+
+      NULL
+    }
+  )
+
+
+  if (is.null(response)) {
+    return(NULL)
+  }
+
+
+  if (
+    httr::status_code(response) != 200
+  ) {
+
+    cat(
+      "access_failure: HTTP",
+      httr::status_code(response),
+      "for",
+      url,
+      "\n"
+    )
+
+    return(NULL)
+  }
+
+
+  raw_data <- httr::content(
+    response,
+    as = "raw"
+  )
+
+
+  writeBin(
+    raw_data,
+    destination
+  )
+
+
+  if (
+    !file.exists(destination) ||
+    file.info(destination)$size < 100
+  ) {
+
+    cat(
+      "access_failure: invalid downloaded file:",
+      destination,
+      "\n"
+    )
+
+    return(NULL)
+  }
+
+
+  cat(
+    "Downloaded:",
+    destination,
+    "(",
+    file.info(destination)$size,
+    "bytes )\n"
+  )
+
+
+  destination
+}
+
+
+prepare_hpo_files <- function() {
+
+  cat(
+    "Checking official HPO files...\n"
+  )
+
+
+  gene_file <- download_file_if_needed(
+    HPO_GENE_URL,
+    HPO_GENE_FILE
+  )
+
+
+  ontology_file <- download_file_if_needed(
+    HPO_OBO_URL,
+    HPO_OBO_FILE
+  )
+
+
+  if (
+    is.null(gene_file) ||
+    !file.exists(gene_file)
+  ) {
+
+    stop(
+      "access_failure: HPO genes_to_phenotype.txt unavailable."
+    )
+  }
+
+
+  if (
+    is.null(ontology_file) ||
+    !file.exists(ontology_file)
+  ) {
+
+    stop(
+      "access_failure: HPO ontology unavailable."
+    )
+  }
+
+
+  list(
+    genes = gene_file,
+    ontology = ontology_file
+  )
+}
+
+
+# ----------------------------------------------------------------------------
+# Read genes_to_phenotype
+# ----------------------------------------------------------------------------
+
+load_gene_annotations <- function(path) {
+
+  cat(
+    "Loading HPO gene annotations...\n"
+  )
+
+
+  df <- tryCatch(
+
     read.delim(
       path,
       header = TRUE,
       sep = "\t",
       quote = "",
-      comment.char = comment,
+      comment.char = "",
       stringsAsFactors = FALSE,
       fill = TRUE,
       check.names = FALSE
     ),
-    error = function(e) NULL
-  )
-}
 
-download_file_if_needed <- function(url, dest, max_age_days = 7) {
-  if (file.exists(dest)) {
-    age <- as.numeric(difftime(Sys.time(), file.mtime(dest), units = "days"))
-    if (!is.na(age) && age < max_age_days) {
-      cat("   ✅ Using cached file:", dest, "(", round(age, 1), "days old)\n")
-      return(dest)
+    error = function(e) {
+
+      cat(
+        "parsing_failure:",
+        conditionMessage(e),
+        "\n"
+      )
+
+      NULL
     }
-  }
+  )
 
-  cat("   📥 Downloading:", url, "\n")
-  ok <- tryCatch({
-    r <- httr::GET(url, httr::timeout(300))
-    if (httr::status_code(r) != 200) return(FALSE)
-    bin <- httr::content(r, "raw")
-    writeBin(bin, dest)
-    TRUE
-  }, error = function(e) {
-    cat("   ❌ Download error:", conditionMessage(e), "\n")
-    FALSE
-  })
 
-  if (!ok || !file.exists(dest) || file.info(dest)$size < 100) {
-    cat("   ❌ Failed or invalid file:", dest, "\n")
-    return(NULL)
-  }
+  if (
+    is.null(df) ||
+    nrow(df) == 0
+  ) {
 
-  cat("   ✅ Downloaded:", dest, "\n")
-  dest
-}
-
-download_all_hpo_files <- function() {
-  cat("📁 Checking HPO data files...\n")
-
-  files <- list(
-    genes_to_phenotype = list(
-      url = "https://purl.obolibrary.org/obo/hp/hpoa/genes_to_phenotype.txt",
-      cache = "hpo_genes_to_phenotype.txt"
-    ),
-    phenotype_hpoa = list(
-      url = "https://purl.obolibrary.org/obo/hp/hpoa/phenotype.hpoa",
-      cache = "hpo_phenotype.hpoa"
-    ),
-    hpo_ontology = list(
-      url = "https://raw.githubusercontent.com/obophenotype/human-phenotype-ontology/master/hp.obo",
-      cache = "hpo_ontology.obo"
+    stop(
+      "parsing_failure: genes_to_phenotype contains no readable rows."
     )
+  }
+
+
+  colnames(df) <- sub(
+    "^#",
+    "",
+    colnames(df)
   )
 
-  out <- list()
-  for (nm in names(files)) {
-    out[[nm]] <- download_file_if_needed(files[[nm]]$url, files[[nm]]$cache, max_age_days = 7)
-    Sys.sleep(0.5)
+
+  required <- c(
+    "ncbi_gene_id",
+    "gene_symbol",
+    "hpo_id",
+    "hpo_name"
+  )
+
+
+  missing <- setdiff(
+    required,
+    colnames(df)
+  )
+
+
+  if (
+    length(missing) > 0
+  ) {
+
+    stop(
+      paste0(
+        "parsing_failure: missing HPO gene columns: ",
+        paste(
+          missing,
+          collapse = ", "
+        )
+      )
+    )
   }
 
-  out
-}
-
-HPO_FILES <- download_all_hpo_files()
-
-download_hpo_ontology <- function() {
-  cat("🔬 Loading HPO ontology...\n")
-
-  cache_rds <- "hpo_ontology.rds"
-  if (file.exists(cache_rds)) {
-    age <- as.numeric(difftime(Sys.time(), file.mtime(cache_rds), units = "days"))
-    if (!is.na(age) && age < 7) {
-      cat("   ✅ Loaded ontology from cache\n")
-      return(readRDS(cache_rds))
-    }
-  }
-
-  if (is.null(HPO_FILES$hpo_ontology) || !file.exists(HPO_FILES$hpo_ontology)) {
-    cat("   ❌ Ontology file not available\n")
-    return(NULL)
-  }
-
-  hpo <- tryCatch({
-    ontologyIndex::get_ontology(HPO_FILES$hpo_ontology, extract_tags = "minimal")
-  }, error = function(e) {
-    cat("   ❌ Ontology parse error:", conditionMessage(e), "\n")
-    NULL
-  })
-
-  if (!is.null(hpo)) {
-    saveRDS(hpo, cache_rds)
-    cat("   ✅ Parsed and cached ontology\n")
-  }
-
-  hpo
-}
-
-load_gene_hpo_annotations <- function() {
-  cat("📥 Loading gene-HPO annotations...\n")
-
-  cache_rds <- "gene_hpo_annotations.rds"
-  if (file.exists(cache_rds)) {
-    age <- as.numeric(difftime(Sys.time(), file.mtime(cache_rds), units = "days"))
-    if (!is.na(age) && age < 1) {
-      x <- readRDS(cache_rds)
-      cat("   ✅ Loaded", nrow(x), "annotations from cache\n")
-      return(x)
-    }
-  }
-
-  if (is.null(HPO_FILES$genes_to_phenotype) || !file.exists(HPO_FILES$genes_to_phenotype)) {
-    cat("   ❌ genes_to_phenotype file not available\n")
-    return(data.frame())
-  }
-
-  df <- safe_read_tsv(HPO_FILES$genes_to_phenotype)
-  if (is.null(df) || nrow(df) == 0) {
-    cat("   ❌ Could not parse genes_to_phenotype file\n")
-    return(data.frame())
-  }
-
-  required <- c("ncbi_gene_id", "gene_symbol", "hpo_id", "hpo_name")
-  if (!all(required %in% colnames(df))) {
-    cat("   ❌ Expected columns not found. Columns were:\n")
-    cat("   ", paste(colnames(df), collapse = ", "), "\n")
-    return(data.frame())
-  }
-
-  df$ncbi_gene_id <- trimws(as.character(df$ncbi_gene_id))
-  df$gene_symbol  <- trimws(as.character(df$gene_symbol))
-  df$hpo_id       <- trimws(as.character(df$hpo_id))
-  df$hpo_name     <- trimws(as.character(df$hpo_name))
-
-  keep <- !is.na(df$gene_symbol) &
-    nzchar(df$gene_symbol) &
-    !grepl("^[0-9]+$", df$gene_symbol) &
-    !is.na(df$hpo_id) &
-    grepl("^HP:[0-9]{7}$", df$hpo_id) &
-    !is.na(df$hpo_name) &
-    nzchar(df$hpo_name)
-
-  df <- df[keep, , drop = FALSE]
 
   out <- data.frame(
-    Gene_ID = df$ncbi_gene_id,
-    Gene = df$gene_symbol,
-    HPO_ID = df$hpo_id,
-    HPO_Term = df$hpo_name,
+
+    Gene_ID =
+      safe_trim(
+        df$ncbi_gene_id
+      ),
+
+    Gene =
+      safe_trim(
+        df$gene_symbol
+      ),
+
+    HPO_ID =
+      safe_trim(
+        df$hpo_id
+      ),
+
+    HPO_Term =
+      safe_trim(
+        df$hpo_name
+      ),
+
     stringsAsFactors = FALSE
   )
 
-  out <- out[!duplicated(paste(out$Gene, out$HPO_ID)), , drop = FALSE]
-  saveRDS(out, cache_rds)
 
-  cat("   ✅ Loaded", nrow(out), "unique gene-HPO annotations\n")
-  cat("   🧬 Unique genes:", length(unique(out$Gene)), "\n")
-  cat("   🏥 Unique HPO terms:", length(unique(out$HPO_ID)), "\n")
-
-  out
-}
-
-load_disease_annotations <- function() {
-  cat("📥 Loading disease annotations...\n")
-
-  cache_rds <- "hpo_disease_annotations.rds"
-  if (file.exists(cache_rds)) {
-    age <- as.numeric(difftime(Sys.time(), file.mtime(cache_rds), units = "days"))
-    if (!is.na(age) && age < 7) {
-      x <- readRDS(cache_rds)
-      cat("   ✅ Loaded", nrow(x), "disease annotations from cache\n")
-      return(x)
-    }
-  }
-
-  if (is.null(HPO_FILES$phenotype_hpoa) || !file.exists(HPO_FILES$phenotype_hpoa)) {
-    cat("   ❌ phenotype.hpoa file not available\n")
-    return(data.frame())
-  }
-
-  lines <- readLines(HPO_FILES$phenotype_hpoa, warn = FALSE)
-  lines <- lines[!grepl("^#", lines) & nzchar(trimws(lines))]
-
-  parsed <- lapply(lines, function(x) strsplit(x, "\t", fixed = TRUE)[[1]])
-  parsed <- parsed[vapply(parsed, length, integer(1)) >= 4]
-
-  if (length(parsed) == 0) return(data.frame())
-
-  df <- data.frame(
-    Disease_ID = vapply(parsed, function(x) trimws(x[1]), character(1)),
-    Disease_Name = vapply(parsed, function(x) trimws(x[2]), character(1)),
-    Qualifier = vapply(parsed, function(x) if (length(x) >= 3) trimws(x[3]) else "", character(1)),
-    HPO_ID = vapply(parsed, function(x) trimws(x[4]), character(1)),
-    stringsAsFactors = FALSE
+  keep <- (
+    nzchar(out$Gene) &
+    !grepl(
+      "^[0-9]+$",
+      out$Gene
+    ) &
+    grepl(
+      "^HP:[0-9]{7}$",
+      out$HPO_ID
+    ) &
+    nzchar(out$HPO_Term)
   )
 
-  df <- df[
-    nzchar(df$Disease_ID) &
-    nzchar(df$Disease_Name) &
-    grepl("^HP:[0-9]{7}$", df$HPO_ID),
+
+  out <- out[
+    keep,
     ,
     drop = FALSE
   ]
 
-  df <- df[!duplicated(paste(df$Disease_ID, df$HPO_ID)), , drop = FALSE]
-  saveRDS(df, cache_rds)
 
-  cat("   ✅ Loaded", nrow(df), "unique disease annotations\n")
-  df
+  out <- out[
+    !duplicated(
+      paste(
+        out$Gene,
+        out$HPO_ID,
+        sep = "|"
+      )
+    ),
+    ,
+    drop = FALSE
+  ]
+
+
+  rownames(out) <- NULL
+
+
+  cat(
+    "Gene-HPO associations:",
+    nrow(out),
+    "\n"
+  )
+
+  cat(
+    "Unique genes:",
+    length(
+      unique(out$Gene)
+    ),
+    "\n"
+  )
+
+  cat(
+    "Unique HPO terms:",
+    length(
+      unique(out$HPO_ID)
+    ),
+    "\n"
+  )
+
+
+  out
 }
 
-medical_variations <- list(
-  migraine = c("migraine", "cephalgia", "hemicrania"),
-  headache = c("headache", "cephalgia", "cephalalgia"),
-  seizure = c("seizure", "epilepsy", "convulsion"),
-  autism = c("autism", "autistic", "asd"),
-  intellectual_disability = c("intellectual disability", "developmental delay", "global developmental delay")
-)
 
-create_search_patterns <- function(phenotype) {
-  x <- tolower(trimws(phenotype))
-  words <- unlist(strsplit(x, "\\s+"))
-  words <- words[nchar(words) > 2]
+# ----------------------------------------------------------------------------
+# Parse official HPO ontology
+# ----------------------------------------------------------------------------
 
-  patterns <- unique(c(
-    x,
-    paste0("\\b", x, "\\b")
-  ))
+extract_synonym_text <- function(line) {
 
-  if (length(words) > 1) {
-    patterns <- c(patterns, paste(words, collapse = " "))
+  m <- regexec(
+    '^synonym:[[:space:]]+"([^"]+)"',
+    line
+  )
+
+  hit <- regmatches(
+    line,
+    m
+  )[[1]]
+
+
+  if (
+    length(hit) >= 2
+  ) {
+
+    return(
+      hit[2]
+    )
   }
 
-  for (nm in names(medical_variations)) {
-    if (grepl(nm, x, fixed = TRUE) || grepl(x, nm, fixed = TRUE)) {
-      patterns <- c(patterns, medical_variations[[nm]])
-      break
+
+  ""
+}
+
+
+parse_hpo_ontology <- function(path) {
+
+  cat(
+    "Parsing HPO ontology labels and synonyms...\n"
+  )
+
+
+  lines <- tryCatch(
+
+    readLines(
+      path,
+      warn = FALSE,
+      encoding = "UTF-8"
+    ),
+
+    error = function(e) {
+
+      cat(
+        "parsing_failure:",
+        conditionMessage(e),
+        "\n"
+      )
+
+      character()
     }
+  )
+
+
+  if (
+    length(lines) == 0
+  ) {
+
+    stop(
+      "parsing_failure: HPO ontology is empty."
+    )
   }
 
-  unique(patterns)
-}
 
-calculate_relevance_score <- function(source) {
-  scores <- c(
-    HPO_Term_Exact = 13,
-    HPO_Term_Contains = 12,
-    HPO_Disease_Exact = 11,
-    HPO_Disease_Contains = 9,
-    HPO_Term_Pattern = 8,
-    HPO_Disease_Pattern = 7,
-    KnownAssociations = 3
-  )
-  if (source %in% names(scores)) scores[[source]] else 1
-}
-
-get_known_phenotype_genes <- function(phenotype) {
-  known_associations <- list(
-    migraine = c("CACNA1A", "ATP1A2", "SCN1A", "KCNK18", "PRRT2"),
-    headache = c("CACNA1A", "ATP1A2", "SCN1A", "KCNK18", "PRRT2"),
-    epilepsy = c("SCN1A", "SCN2A", "SCN8A", "KCNQ2", "KCNQ3", "CDKL5", "ARX", "STXBP1"),
-    seizure = c("SCN1A", "SCN2A", "SCN8A", "KCNQ2", "KCNQ3"),
-    autism = c("SHANK3", "NRXN1", "NLGN3", "NLGN4", "MECP2", "FMR1", "TSC1", "TSC2"),
-    diabetes = c("INS", "GCGR", "HNF1A", "HNF4A", "GCK", "PDX1"),
-    cancer = c("TP53", "BRCA1", "BRCA2", "APC", "MLH1", "MSH2", "PTEN")
+  term_starts <- which(
+    trimws(lines) == "[Term]"
   )
 
-  p <- tolower(trimws(phenotype))
-  out <- c()
-  for (k in names(known_associations)) {
-    if (grepl(k, p, fixed = TRUE) || grepl(p, k, fixed = TRUE)) {
-      out <- c(out, known_associations[[k]])
+
+  if (
+    length(term_starts) == 0
+  ) {
+
+    stop(
+      "parsing_failure: no [Term] entries found in HPO ontology."
+    )
+  }
+
+
+  primary_rows <- list()
+  synonym_rows <- list()
+  alt_rows <- list()
+
+  p_idx <- 1
+  s_idx <- 1
+  a_idx <- 1
+
+
+  for (
+    i in seq_along(
+      term_starts
+    )
+  ) {
+
+    start <- term_starts[i] + 1
+
+
+    if (
+      i < length(term_starts)
+    ) {
+
+      end <- term_starts[i + 1] - 1
+
+    } else {
+
+      end <- length(lines)
     }
-  }
-  unique(out)
-}
 
-download_hpo_alternative <- function(phenotype) {
-  cat("🔄 Using fallback approach for:", phenotype, "\n")
-  known_genes <- get_known_phenotype_genes(phenotype)
 
-  if (length(known_genes) == 0) return(data.frame())
+    block <- lines[
+      start:end
+    ]
 
-  data.frame(
-    Gene = known_genes,
-    HPO_ID = "Known_Association",
-    HPO_Term = phenotype,
-    Gene_ID = "",
-    Source = "KnownAssociations",
-    Match_Pattern = phenotype,
-    stringsAsFactors = FALSE
-  )
-}
 
-download_hpo_genes <- function(phenotype) {
-  cat("🔍 Searching for genes associated with:", phenotype, "\n")
-
-  annotations <- load_gene_hpo_annotations()
-  disease_annotations <- load_disease_annotations()
-
-  if (nrow(annotations) == 0) {
-    cat("   ⚠️  No direct HPO annotations available\n")
-    return(download_hpo_alternative(phenotype))
-  }
-
-  patterns <- create_search_patterns(phenotype)
-  phenotype_lower <- tolower(trimws(phenotype))
-
-  annotations$HPO_Term_Lower <- tolower(annotations$HPO_Term)
-  all_hits <- list()
-
-  cat("   🔎 Search patterns:", paste(head(patterns, 5), collapse = ", "), "\n")
-
-  for (pat in patterns) {
-    pat_lower <- tolower(pat)
-    idx <- grepl(pat_lower, annotations$HPO_Term_Lower, fixed = TRUE)
-
-    if (!any(idx)) next
-
-    tmp <- annotations[idx, c("Gene", "HPO_ID", "HPO_Term", "Gene_ID"), drop = FALSE]
-
-    exact <- tmp$HPO_Term_Lower <- tolower(tmp$HPO_Term)
-    src <- ifelse(
-      exact == phenotype_lower,
-      "HPO_Term_Exact",
-      ifelse(grepl(phenotype_lower, exact, fixed = TRUE), "HPO_Term_Contains", "HPO_Term_Pattern")
+    next_section <- which(
+      grepl(
+        "^\\[",
+        trimws(block)
+      )
     )
 
-    tmp$Source <- src
-    tmp$Match_Pattern <- pat
-    all_hits[[length(all_hits) + 1]] <- tmp
-  }
 
-  res <- if (length(all_hits) > 0) do.call(rbind, all_hits) else data.frame()
+    if (
+      length(next_section) > 0
+    ) {
 
-  if (nrow(disease_annotations) > 0 && nrow(res) < 50) {
-    disease_annotations$Disease_Name_Lower <- tolower(disease_annotations$Disease_Name)
-    didx <- grepl(phenotype_lower, disease_annotations$Disease_Name_Lower, fixed = TRUE)
+      first_section <- next_section[1]
 
-    if (any(didx)) {
-      matched_hpo <- unique(disease_annotations$HPO_ID[didx])
-      extra <- annotations[annotations$HPO_ID %in% matched_hpo, c("Gene", "HPO_ID", "HPO_Term", "Gene_ID"), drop = FALSE]
-      if (nrow(extra) > 0) {
-        extra$Source <- "HPO_Disease_Pattern"
-        extra$Match_Pattern <- "disease_match"
-        res <- rbind(res, extra)
+      if (
+        first_section > 1
+      ) {
+
+        block <- block[
+          seq_len(
+            first_section - 1
+          )
+        ]
+
+      } else {
+
+        next
+      }
+    }
+
+
+    obsolete <- any(
+      grepl(
+        "^is_obsolete:[[:space:]]*true",
+        block
+      )
+    )
+
+
+    if (obsolete) {
+      next
+    }
+
+
+    id_line <- grep(
+      "^id:[[:space:]]*HP:[0-9]{7}",
+      block,
+      value = TRUE
+    )
+
+
+    name_line <- grep(
+      "^name:[[:space:]]*",
+      block,
+      value = TRUE
+    )
+
+
+    if (
+      length(id_line) == 0 ||
+      length(name_line) == 0
+    ) {
+
+      next
+    }
+
+
+    hpo_id <- sub(
+      "^id:[[:space:]]*",
+      "",
+      id_line[1]
+    )
+
+
+    hpo_name <- sub(
+      "^name:[[:space:]]*",
+      "",
+      name_line[1]
+    )
+
+
+    hpo_id <- safe_trim(
+      hpo_id
+    )
+
+    hpo_name <- safe_trim(
+      hpo_name
+    )
+
+
+    if (
+      !grepl(
+        "^HP:[0-9]{7}$",
+        hpo_id
+      ) ||
+      !nzchar(
+        hpo_name
+      )
+    ) {
+
+      next
+    }
+
+
+    primary_rows[[p_idx]] <- data.frame(
+
+      HPO_ID = hpo_id,
+
+      HPO_Name = hpo_name,
+
+      Normalized_Name =
+        normalize_text(
+          hpo_name
+        ),
+
+      stringsAsFactors = FALSE
+    )
+
+    p_idx <- p_idx + 1
+
+
+    # ------------------------------------------------------------------------
+    # Official HPO synonyms
+    # ------------------------------------------------------------------------
+
+    syn_lines <- grep(
+      "^synonym:[[:space:]]*",
+      block,
+      value = TRUE
+    )
+
+
+    if (
+      length(syn_lines) > 0
+    ) {
+
+      for (
+        syn_line in syn_lines
+      ) {
+
+        synonym <- extract_synonym_text(
+          syn_line
+        )
+
+
+        if (
+          nzchar(
+            synonym
+          )
+        ) {
+
+          synonym_rows[[s_idx]] <- data.frame(
+
+            HPO_ID = hpo_id,
+
+            HPO_Name = hpo_name,
+
+            Synonym = synonym,
+
+            Normalized_Synonym =
+              normalize_text(
+                synonym
+              ),
+
+            stringsAsFactors = FALSE
+          )
+
+          s_idx <- s_idx + 1
+        }
+      }
+    }
+
+
+    # ------------------------------------------------------------------------
+    # Alternate HPO identifiers
+    # ------------------------------------------------------------------------
+
+    alt_lines <- grep(
+      "^alt_id:[[:space:]]*HP:[0-9]{7}",
+      block,
+      value = TRUE
+    )
+
+
+    if (
+      length(alt_lines) > 0
+    ) {
+
+      for (
+        alt_line in alt_lines
+      ) {
+
+        alt_id <- sub(
+          "^alt_id:[[:space:]]*",
+          "",
+          alt_line
+        )
+
+
+        alt_id <- safe_trim(
+          alt_id
+        )
+
+
+        if (
+          grepl(
+            "^HP:[0-9]{7}$",
+            alt_id
+          )
+        ) {
+
+          alt_rows[[a_idx]] <- data.frame(
+
+            Alt_ID = alt_id,
+
+            HPO_ID = hpo_id,
+
+            HPO_Name = hpo_name,
+
+            stringsAsFactors = FALSE
+          )
+
+          a_idx <- a_idx + 1
+        }
       }
     }
   }
 
-  if (nrow(res) == 0) {
-    cat("   ⚠️  No matches found in HPO annotations\n")
-    return(download_hpo_alternative(phenotype))
+
+  if (
+    length(primary_rows) == 0
+  ) {
+
+    stop(
+      "parsing_failure: HPO ontology produced no usable terms."
+    )
   }
 
-  res <- res[!duplicated(paste(res$Gene, res$HPO_ID)), , drop = FALSE]
-  res$Relevance_Score <- vapply(res$Source, calculate_relevance_score, numeric(1))
-  res <- res[order(-res$Relevance_Score, res$Gene), , drop = FALSE]
-  res$Relevance_Score <- NULL
 
-  cat("   ✅ Total associations:", nrow(res), "\n")
-  cat("   🧬 Unique genes:", length(unique(res$Gene)), "\n")
+  primary <- do.call(
+    rbind,
+    primary_rows
+  )
 
-  res
+
+  synonyms <- if (
+    length(synonym_rows) > 0
+  ) {
+
+    do.call(
+      rbind,
+      synonym_rows
+    )
+
+  } else {
+
+    data.frame(
+      HPO_ID = character(),
+      HPO_Name = character(),
+      Synonym = character(),
+      Normalized_Synonym = character(),
+      stringsAsFactors = FALSE
+    )
+  }
+
+
+  alt_ids <- if (
+    length(alt_rows) > 0
+  ) {
+
+    do.call(
+      rbind,
+      alt_rows
+    )
+
+  } else {
+
+    data.frame(
+      Alt_ID = character(),
+      HPO_ID = character(),
+      HPO_Name = character(),
+      stringsAsFactors = FALSE
+    )
+  }
+
+
+  primary <- primary[
+    !duplicated(
+      primary$HPO_ID
+    ),
+    ,
+    drop = FALSE
+  ]
+
+
+  synonyms <- synonyms[
+    !duplicated(
+      paste(
+        synonyms$HPO_ID,
+        synonyms$Normalized_Synonym,
+        sep = "|"
+      )
+    ),
+    ,
+    drop = FALSE
+  ]
+
+
+  alt_ids <- alt_ids[
+    !duplicated(
+      alt_ids$Alt_ID
+    ),
+    ,
+    drop = FALSE
+  ]
+
+
+  rownames(primary) <- NULL
+  rownames(synonyms) <- NULL
+  rownames(alt_ids) <- NULL
+
+
+  cat(
+    "HPO primary terms:",
+    nrow(primary),
+    "\n"
+  )
+
+  cat(
+    "HPO official synonyms:",
+    nrow(synonyms),
+    "\n"
+  )
+
+  cat(
+    "HPO alternate IDs:",
+    nrow(alt_ids),
+    "\n"
+  )
+
+
+  list(
+    primary = primary,
+    synonyms = synonyms,
+    alt_ids = alt_ids
+  )
 }
 
-main <- function() {
-  args <- commandArgs(trailingOnly = TRUE)
 
-  if (length(args) < 1) {
-    cat("Usage: Rscript hpo.R <phenotype> [output_file]\n")
-    cat("Example: Rscript hpo.R migraine\n")
-    quit(status = 1)
+# ----------------------------------------------------------------------------
+# Safe HPO term resolution
+# ----------------------------------------------------------------------------
+
+resolution_result <- function(
+  accepted,
+  reason,
+  hpo_id = "",
+  hpo_name = "",
+  matched_text = ""
+) {
+
+  list(
+    accepted = accepted,
+    reason = reason,
+    HPO_ID = hpo_id,
+    HPO_Name = hpo_name,
+    Matched_Text = matched_text
+  )
+}
+
+
+resolve_hpo_term <- function(
+  phenotype,
+  ontology
+) {
+
+  raw_query <- safe_trim(
+    phenotype
+  )
+
+
+  normalized_query <- normalize_text(
+    phenotype
+  )
+
+
+  # --------------------------------------------------------------------------
+  # 1. Exact current HPO ID
+  # --------------------------------------------------------------------------
+
+  if (
+    grepl(
+      "^HP:[0-9]{7}$",
+      toupper(
+        raw_query
+      )
+    )
+  ) {
+
+    query_id <- toupper(
+      raw_query
+    )
+
+
+    current <- ontology$primary[
+      ontology$primary$HPO_ID ==
+        query_id,
+      ,
+      drop = FALSE
+    ]
+
+
+    if (
+      nrow(current) == 1
+    ) {
+
+      return(
+        resolution_result(
+          TRUE,
+          "HPO_ID_Exact",
+          current$HPO_ID[1],
+          current$HPO_Name[1],
+          query_id
+        )
+      )
+    }
+
+
+    alt <- ontology$alt_ids[
+      ontology$alt_ids$Alt_ID ==
+        query_id,
+      ,
+      drop = FALSE
+    ]
+
+
+    if (
+      nrow(alt) == 1
+    ) {
+
+      return(
+        resolution_result(
+          TRUE,
+          "HPO_Alt_ID_Exact",
+          alt$HPO_ID[1],
+          alt$HPO_Name[1],
+          query_id
+        )
+      )
+    }
+
+
+    return(
+      resolution_result(
+        FALSE,
+        "UNKNOWN_HPO_ID"
+      )
+    )
   }
+
+
+  # --------------------------------------------------------------------------
+  # 2. Exact normalized primary HPO term
+  # --------------------------------------------------------------------------
+
+  exact_primary <- ontology$primary[
+    ontology$primary$Normalized_Name ==
+      normalized_query,
+    ,
+    drop = FALSE
+  ]
+
+
+  exact_primary <- exact_primary[
+    !duplicated(
+      exact_primary$HPO_ID
+    ),
+    ,
+    drop = FALSE
+  ]
+
+
+  if (
+    nrow(exact_primary) == 1
+  ) {
+
+    return(
+      resolution_result(
+        TRUE,
+        "HPO_Term_Exact",
+        exact_primary$HPO_ID[1],
+        exact_primary$HPO_Name[1],
+        exact_primary$HPO_Name[1]
+      )
+    )
+  }
+
+
+  if (
+    nrow(exact_primary) > 1
+  ) {
+
+    return(
+      resolution_result(
+        FALSE,
+        "AMBIGUOUS_HPO_PRIMARY_TERM"
+      )
+    )
+  }
+
+
+  # --------------------------------------------------------------------------
+  # 3. Exact normalized official HPO synonym
+  # --------------------------------------------------------------------------
+
+  exact_synonym <- ontology$synonyms[
+    ontology$synonyms$Normalized_Synonym ==
+      normalized_query,
+    ,
+    drop = FALSE
+  ]
+
+
+  exact_synonym <- exact_synonym[
+    !duplicated(
+      exact_synonym$HPO_ID
+    ),
+    ,
+    drop = FALSE
+  ]
+
+
+  if (
+    nrow(exact_synonym) == 1
+  ) {
+
+    return(
+      resolution_result(
+        TRUE,
+        "HPO_Synonym_Exact",
+        exact_synonym$HPO_ID[1],
+        exact_synonym$HPO_Name[1],
+        exact_synonym$Synonym[1]
+      )
+    )
+  }
+
+
+  if (
+    nrow(exact_synonym) > 1
+  ) {
+
+    return(
+      resolution_result(
+        FALSE,
+        "AMBIGUOUS_HPO_SYNONYM"
+      )
+    )
+  }
+
+
+  # --------------------------------------------------------------------------
+  # IMPORTANT:
+  #
+  # Do NOT automatically use substring/pattern/disease expansion here.
+  #
+  # A failure to map exactly is recorded as unsupported_query.
+  # --------------------------------------------------------------------------
+
+  resolution_result(
+    FALSE,
+    "NO_EXACT_HPO_TERM_OR_SYNONYM"
+  )
+}
+
+
+# ----------------------------------------------------------------------------
+# Resolution audit
+# ----------------------------------------------------------------------------
+
+save_resolution <- function(
+  phenotype,
+  resolution,
+  path
+) {
+
+  audit <- data.frame(
+
+    Input_Term =
+      phenotype,
+
+    Accepted =
+      isTRUE(
+        resolution$accepted
+      ),
+
+    Resolution_Method =
+      resolution$reason,
+
+    Matched_HPO_ID =
+      resolution$HPO_ID,
+
+    Matched_HPO_Name =
+      resolution$HPO_Name,
+
+    Matched_Text =
+      resolution$Matched_Text,
+
+    Retrieval_Timestamp =
+      format(
+        Sys.time(),
+        "%Y-%m-%dT%H:%M:%S%z"
+      ),
+
+    stringsAsFactors = FALSE
+  )
+
+
+  write.csv(
+    audit,
+    path,
+    row.names = FALSE
+  )
+}
+
+
+# ----------------------------------------------------------------------------
+# Retrieve direct gene-HPO annotations
+# ----------------------------------------------------------------------------
+
+retrieve_genes_for_hpo <- function(
+  phenotype,
+  resolution,
+  gene_annotations
+) {
+
+  if (
+    !isTRUE(
+      resolution$accepted
+    )
+  ) {
+
+    return(
+      data.frame()
+    )
+  }
+
+
+  result <- gene_annotations[
+    gene_annotations$HPO_ID ==
+      resolution$HPO_ID,
+    ,
+    drop = FALSE
+  ]
+
+
+  if (
+    nrow(result) == 0
+  ) {
+
+    return(
+      data.frame()
+    )
+  }
+
+
+  # --------------------------------------------------------------------------
+  # Every returned row is a DIRECT gene-HPO annotation.
+  # --------------------------------------------------------------------------
+
+  result$Source <- (
+    resolution$reason
+  )
+
+
+  result$Match_Pattern <- (
+    resolution$Matched_Text
+  )
+
+
+  result$Input_Term <- (
+    phenotype
+  )
+
+
+  result$Matched_Term <- (
+    resolution$HPO_Name
+  )
+
+
+  result$Matched_Identifier <- (
+    resolution$HPO_ID
+  )
+
+
+  result$Matched_Ontology <- (
+    "HPO"
+  )
+
+
+  result$Evidence_Class <- (
+    "curated_clinical"
+  )
+
+
+  result$Association_Type <- (
+    "gene_hpo_annotation"
+  )
+
+
+  result$Query_Method <- (
+    resolution$reason
+  )
+
+
+  result$Source_Rank <- seq_len(
+    nrow(result)
+  )
+
+
+  result$Retrieval_Timestamp <- format(
+    Sys.time(),
+    "%Y-%m-%dT%H:%M:%S%z"
+  )
+
+
+  result <- result[
+    ,
+    c(
+      "Gene",
+      "HPO_ID",
+      "HPO_Term",
+      "Gene_ID",
+      "Source",
+      "Match_Pattern",
+      "Input_Term",
+      "Matched_Term",
+      "Matched_Identifier",
+      "Matched_Ontology",
+      "Evidence_Class",
+      "Association_Type",
+      "Query_Method",
+      "Source_Rank",
+      "Retrieval_Timestamp"
+    ),
+    drop = FALSE
+  ]
+
+
+  result <- result[
+    !duplicated(
+      paste(
+        result$Gene,
+        result$HPO_ID,
+        sep = "|"
+      )
+    ),
+    ,
+    drop = FALSE
+  ]
+
+
+  result <- result[
+    order(
+      result$Gene
+    ),
+    ,
+    drop = FALSE
+  ]
+
+
+  result$Source_Rank <- seq_len(
+    nrow(result)
+  )
+
+
+  rownames(result) <- NULL
+
+
+  result
+}
+
+
+# ----------------------------------------------------------------------------
+# Stale output removal
+# ----------------------------------------------------------------------------
+
+remove_stale_outputs <- function(
+  phenotype
+) {
+
+  clean <- clean_filename(
+    phenotype
+  )
+
+
+  files <- c(
+
+    file.path(
+      OUTPUT_DIR,
+      paste0(
+        clean,
+        "_hpo.csv"
+      )
+    ),
+
+    file.path(
+      OUTPUT_DIR,
+      paste0(
+        clean,
+        "_hpo_genes.csv"
+      )
+    ),
+
+    file.path(
+      OUTPUT_DIR,
+      paste0(
+        clean,
+        "_hpo_resolution.csv"
+      )
+    )
+  )
+
+
+  for (
+    f in files
+  ) {
+
+    if (
+      file.exists(f)
+    ) {
+
+      file.remove(f)
+
+      cat(
+        "Removed stale HPO output:",
+        f,
+        "\n"
+      )
+    }
+  }
+}
+
+
+# ----------------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------------
+
+main <- function() {
+
+  args <- commandArgs(
+    trailingOnly = TRUE
+  )
+
+
+  if (
+    length(args) < 1
+  ) {
+
+    cat(
+      "HPO Gene Downloader\n"
+    )
+
+    cat(
+      "Usage: Rscript hpo.R <phenotype>\n"
+    )
+
+    cat(
+      "Example: Rscript hpo.R migraine\n"
+    )
+
+    quit(
+      status = 1
+    )
+  }
+
 
   phenotype <- args[1]
 
-  output_dir <- "AllPackagesGenes"
-  if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
 
-  clean_phenotype <- gsub("[^A-Za-z0-9_-]", "_", phenotype)
-  clean_phenotype <- gsub("_{2,}", "_", clean_phenotype)
-  clean_phenotype <- gsub("^_|_$", "", clean_phenotype)
+  if (
+    !dir.exists(
+      OUTPUT_DIR
+    )
+  ) {
 
-  output_file <- if (length(args) > 1) args[2] else file.path(output_dir, paste0(clean_phenotype, "_hpo.csv"))
-  genes_only_file <- file.path(output_dir, paste0(clean_phenotype, "_hpo_genes.csv"))
-
-  cat("🚀 Starting HPO gene search for:", phenotype, "\n")
-  cat("📁 Output directory:", output_dir, "\n")
-
-  results <- download_hpo_genes(phenotype)
-
-  if (nrow(results) > 0) {
-    write.csv(results, output_file, row.names = FALSE)
-    write.csv(data.frame(Gene = unique(results$Gene), stringsAsFactors = FALSE), genes_only_file, row.names = FALSE)
-
-    cat("✅ Results saved to:", output_file, "\n")
-    cat("🧬 Genes-only file saved to:", genes_only_file, "\n")
-    cat("📊 Found", nrow(results), "gene associations\n")
-    cat("🧬 Unique genes:", length(unique(results$Gene)), "\n")
-  } else {
-    cat("❌ No genes found for phenotype:", phenotype, "\n")
-    cat("💡 Try different search terms or check HPO data availability\n")
+    dir.create(
+      OUTPUT_DIR,
+      recursive = TRUE
+    )
   }
+
+
+  clean <- clean_filename(
+    phenotype
+  )
+
+
+  full_file <- file.path(
+    OUTPUT_DIR,
+    paste0(
+      clean,
+      "_hpo.csv"
+    )
+  )
+
+
+  genes_file <- file.path(
+    OUTPUT_DIR,
+    paste0(
+      clean,
+      "_hpo_genes.csv"
+    )
+  )
+
+
+  resolution_file <- file.path(
+    OUTPUT_DIR,
+    paste0(
+      clean,
+      "_hpo_resolution.csv"
+    )
+  )
+
+
+  cat(
+    "\n============================================================\n"
+  )
+
+  cat(
+    "HPO DIRECT STRUCTURED RETRIEVAL\n"
+  )
+
+  cat(
+    "============================================================\n"
+  )
+
+  cat(
+    "Input term:",
+    phenotype,
+    "\n"
+  )
+
+  cat(
+    "Start time:",
+    format(
+      Sys.time()
+    ),
+    "\n\n"
+  )
+
+
+  remove_stale_outputs(
+    phenotype
+  )
+
+
+  files <- tryCatch(
+
+    prepare_hpo_files(),
+
+    error = function(e) {
+
+      cat(
+        conditionMessage(e),
+        "\n"
+      )
+
+      NULL
+    }
+  )
+
+
+  if (
+    is.null(files)
+  ) {
+
+    quit(
+      status = 2
+    )
+  }
+
+
+  gene_annotations <- tryCatch(
+
+    load_gene_annotations(
+      files$genes
+    ),
+
+    error = function(e) {
+
+      cat(
+        conditionMessage(e),
+        "\n"
+      )
+
+      NULL
+    }
+  )
+
+
+  if (
+    is.null(gene_annotations)
+  ) {
+
+    quit(
+      status = 3
+    )
+  }
+
+
+  ontology <- tryCatch(
+
+    parse_hpo_ontology(
+      files$ontology
+    ),
+
+    error = function(e) {
+
+      cat(
+        conditionMessage(e),
+        "\n"
+      )
+
+      NULL
+    }
+  )
+
+
+  if (
+    is.null(ontology)
+  ) {
+
+    quit(
+      status = 3
+    )
+  }
+
+
+  # --------------------------------------------------------------------------
+  # Resolve query
+  # --------------------------------------------------------------------------
+
+  resolution <- resolve_hpo_term(
+    phenotype,
+    ontology
+  )
+
+
+  save_resolution(
+    phenotype,
+    resolution,
+    resolution_file
+  )
+
+
+  cat(
+    "\nResolution:",
+    resolution$reason,
+    "\n"
+  )
+
+
+  if (
+    isTRUE(
+      resolution$accepted
+    )
+  ) {
+
+    cat(
+      "Matched HPO term:",
+      resolution$HPO_Name,
+      "\n"
+    )
+
+    cat(
+      "Matched HPO ID:",
+      resolution$HPO_ID,
+      "\n"
+    )
+
+    cat(
+      "Matched text:",
+      resolution$Matched_Text,
+      "\n"
+    )
+  }
+
+
+  if (
+    !isTRUE(
+      resolution$accepted
+    )
+  ) {
+
+    cat(
+      "\nunsupported_query: input could not be resolved to an exact ",
+      "HPO term, official HPO synonym or HPO identifier.\n",
+      sep = ""
+    )
+
+    cat(
+      "Resolution audit:",
+      resolution_file,
+      "\n"
+    )
+
+    cat(
+      "End time:",
+      format(
+        Sys.time()
+      ),
+      "\n"
+    )
+
+    quit(
+      status = 0
+    )
+  }
+
+
+  # --------------------------------------------------------------------------
+  # Direct gene-HPO associations
+  # --------------------------------------------------------------------------
+
+  results <- retrieve_genes_for_hpo(
+    phenotype,
+    resolution,
+    gene_annotations
+  )
+
+
+  if (
+    nrow(results) == 0
+  ) {
+
+    cat(
+      "\nsuccessful_no_results: HPO concept resolved successfully ",
+      "but has no gene annotations.\n",
+      sep = ""
+    )
+
+    cat(
+      "Resolution audit:",
+      resolution_file,
+      "\n"
+    )
+
+    cat(
+      "End time:",
+      format(
+        Sys.time()
+      ),
+      "\n"
+    )
+
+    quit(
+      status = 0
+    )
+  }
+
+
+  # --------------------------------------------------------------------------
+  # Save
+  # --------------------------------------------------------------------------
+
+  write.csv(
+    results,
+    full_file,
+    row.names = FALSE
+  )
+
+
+  genes_only <- data.frame(
+
+    Gene = sort(
+      unique(
+        results$Gene
+      )
+    ),
+
+    stringsAsFactors = FALSE
+  )
+
+
+  write.csv(
+    genes_only,
+    genes_file,
+    row.names = FALSE
+  )
+
+
+  cat(
+    "\n============================================================\n"
+  )
+
+  cat(
+    "SUCCESS\n"
+  )
+
+  cat(
+    "============================================================\n"
+  )
+
+  cat(
+    "Resolution method:",
+    resolution$reason,
+    "\n"
+  )
+
+  cat(
+    "HPO term:",
+    resolution$HPO_Name,
+    "\n"
+  )
+
+  cat(
+    "HPO ID:",
+    resolution$HPO_ID,
+    "\n"
+  )
+
+  cat(
+    "Direct associations:",
+    nrow(results),
+    "\n"
+  )
+
+  cat(
+    "Unique genes:",
+    nrow(genes_only),
+    "\n"
+  )
+
+  cat(
+    "Full output:",
+    full_file,
+    "\n"
+  )
+
+  cat(
+    "Genes output:",
+    genes_file,
+    "\n"
+  )
+
+  cat(
+    "Resolution audit:",
+    resolution_file,
+    "\n"
+  )
+
+
+  cat(
+    "\nGenes:\n"
+  )
+
+
+  preview <- head(
+    genes_only$Gene,
+    100
+  )
+
+
+  cat(
+    paste(
+      preview,
+      collapse = ", "
+    ),
+    "\n"
+  )
+
+
+  cat(
+    "\nEnd time:",
+    format(
+      Sys.time()
+    ),
+    "\n"
+  )
 }
 
-if (!interactive()) {
+
+if (
+  !interactive()
+) {
+
   main()
 }
+ 
