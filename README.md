@@ -676,5 +676,4 @@ When reporting an issue, please include:
 **Software name:** PhenoGeneR  
 **Licence:** MIT  
 **Repository:** https://github.com/MuhammadMuneeb007/PhenoGeneR  
-**Bioinformatics submission release:** `TO BE TAGGED`  
-**Zenodo DOI:** `TO BE ADDED BEFORE SUBMISSION`
+
