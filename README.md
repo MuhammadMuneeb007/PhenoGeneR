@@ -540,12 +540,6 @@ For manuscript reproduction, keep the following together in the frozen release:
 
 The frozen Bioinformatics submission release should be archived in a persistent repository.
 
-### Persistent archive
-
-**Zenodo DOI:** `TO BE ADDED BEFORE SUBMISSION`
-
-After the DOI is minted, replace the placeholder above and use the same DOI in the manuscript Availability and Data Availability statements.
-
 ---
 
 ## Important interpretation notes
